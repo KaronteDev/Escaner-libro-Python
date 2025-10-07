@@ -133,9 +133,9 @@ class BookScannerApp:
         ttk.Label(frame_form, text="Archivo/Biblioteca:").pack(anchor="w", pady=(10, 0))
         ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
 
-    # Auto-save metadata option
-    self.autosave_var = tk.BooleanVar(value=True)
-    ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
+        # Auto-save metadata option
+        self.autosave_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
 
 
         # store buttons so we can enable/disable them during scanning
@@ -204,6 +204,24 @@ class BookScannerApp:
                     v._autosave_trace_id = tid
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def _on_metadata_changed(self, *args):
+        # called by StringVar trace; autosave if enabled and folder exists
+        try:
+            if getattr(self, 'autosave_var', None) and self.autosave_var.get():
+                # small debounce: schedule save after short delay on main thread
+                try:
+                    self.root.after_cancel(getattr(self, '_autosave_after_id', None))
+                except Exception:
+                    pass
+                try:
+                    aid = self.root.after(300, lambda: self._save_folder_metadata())
+                    self._autosave_after_id = aid
+                except Exception:
+                    # fallback immediate
+                    self._save_folder_metadata()
         except Exception:
             pass
 
@@ -478,6 +496,12 @@ class BookScannerApp:
             self.agregar_metadatos_pdf(pdf_path)
         except Exception:
             pass
+        # autosave folder metadata after export
+        try:
+            if getattr(self, 'autosave_var', None) and self.autosave_var.get():
+                self._save_folder_metadata()
+        except Exception:
+            pass
         messagebox.showinfo("Exportación completada", f"PDF generado:\n{pdf_path}")
 
     def _do_scan(self, imagen, timeout=8.0):
@@ -564,6 +588,12 @@ class BookScannerApp:
             self.contador += 1
         finally:
             self._scanning = False
+            # autosave metadata after scan (update counter etc.)
+            try:
+                if getattr(self, 'autosave_var', None) and self.autosave_var.get():
+                    self._save_folder_metadata()
+            except Exception:
+                pass
             try:
                 self.root.after(50, lambda: (self._set_ui_enabled(True), self.status_var.set('Listo')))
             except Exception:
