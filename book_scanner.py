@@ -133,6 +133,10 @@ class BookScannerApp:
         ttk.Label(frame_form, text="Archivo/Biblioteca:").pack(anchor="w", pady=(10, 0))
         ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
 
+    # Auto-save metadata option
+    self.autosave_var = tk.BooleanVar(value=True)
+    ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
+
 
         # store buttons so we can enable/disable them during scanning
         self.btn_crear = ttk.Button(frame_form, text="📁 Crear carpeta", command=self.crear_carpeta)
@@ -186,6 +190,22 @@ class BookScannerApp:
         self.frame_thumbs.bind("<Configure>", lambda e: self.canvas_gallery.configure(scrollregion=self.canvas_gallery.bbox("all")))
 
         self.root.bind("<space>", lambda e: self.escanear())
+
+        # install traces to auto-save metadata on change
+        try:
+            for v in (self.titulo_var, self.autor_var, self.tema_var, self.signatura_var, self.archivo_var):
+                # remove existing traces if present
+                try:
+                    v.trace_vdelete('w', v._autosave_trace_id)
+                except Exception:
+                    pass
+                tid = v.trace_add('write', self._on_metadata_changed)
+                try:
+                    v._autosave_trace_id = tid
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ---------------- camera -------------------------------------------------
     def _enumerar_camaras(self, max_test=6):
