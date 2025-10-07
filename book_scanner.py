@@ -254,11 +254,7 @@ class BookScannerApp:
                     child.destroy()
             except Exception:
                 pass
-            # reset desired order marker
-            try:
-                self._desired_thumb_order = None
-            except Exception:
-                pass
+            # preserve any desired order marker (set by _load_folder_metadata) - do not reset here
         except Exception:
             pass
 
@@ -269,6 +265,29 @@ class BookScannerApp:
             if not self.carpeta_salida or not os.path.isdir(self.carpeta_salida):
                 return
             archivos = sorted([f for f in os.listdir(self.carpeta_salida) if f.lower().endswith('.png')])
+
+            # if metadata contains an explicit order, honor it: place ordered files first
+            try:
+                mdpath = self._folder_metadata_path()
+                desired = None
+                if mdpath and os.path.exists(mdpath):
+                    try:
+                        with open(mdpath, 'r', encoding='utf-8') as mf:
+                            mdata = json.load(mf)
+                            desired = mdata.get('order')
+                    except Exception:
+                        desired = None
+                if desired:
+                    # keep only files that still exist and end with .png
+                    desired = [d for d in desired if d.lower().endswith('.png') and os.path.exists(os.path.join(self.carpeta_salida, d))]
+                    remaining = [a for a in archivos if a not in desired]
+                    archivos = desired + remaining
+                    # store for possible post-load ordering operations
+                    self._desired_thumb_order = archivos.copy()
+                else:
+                    self._desired_thumb_order = None
+            except Exception:
+                self._desired_thumb_order = None
 
             # prepare progress
             total = len(archivos)
@@ -319,7 +338,10 @@ class BookScannerApp:
                 # if metadata requested a particular order, apply it
                 try:
                     if getattr(self, '_desired_thumb_order', None):
-                        self._apply_desired_order()
+                        try:
+                            self._apply_desired_order()
+                        except Exception:
+                            pass
                 except Exception:
                     pass
         except Exception:
@@ -857,7 +879,16 @@ class BookScannerApp:
 
             saved = []
             for i, pag in enumerate(paginas, start=1):
-                nombre = f"{self.titulo_var.get().strip() or 'escaneo'}_{self.contador:03d}_p{i}.png"
+                # build safe filename: {signatura}{title}_{contador:03d}_p{i}.png
+                sign = self.signatura_var.get().strip() or ''
+                title = self.titulo_var.get().strip() or 'escaneo'
+                def_suf = f"_p{i}"
+                # sanitize components
+                def _sanitize(s):
+                    return re.sub(r"[^A-Za-z0-9\-_ ]+", '', s).strip().replace(' ', '_')
+                sign_s = _sanitize(sign)
+                title_s = _sanitize(title)
+                nombre = f"{sign_s}{title_s}_{self.contador:03d}{def_suf}.png"
                 ruta = os.path.join(self.carpeta_salida, nombre)
                 try:
                     if len(pag.shape) == 2:
@@ -997,6 +1028,13 @@ class BookScannerApp:
             'archivo': self.archivo_var.get().strip(),
             'contador': self.contador,
         }
+        # persist explicit order of thumbnails (filenames)
+        try:
+            order = [os.path.basename(getattr(lbl, 'filepath', '')) for lbl in self.thumbnails if getattr(lbl, 'filepath', None)]
+            if order:
+                data['order'] = order
+        except Exception:
+            pass
         # persist timestamp
         try:
             now = datetime.datetime.now().isoformat()
@@ -1017,6 +1055,109 @@ class BookScannerApp:
                 pass
         except Exception as e:
             print('Error guardando metadata folder:', e)
+
+    def _apply_desired_order(self):
+        """Reorder self.thumbnails widgets according to the filenames in _desired_thumb_order."""
+        try:
+            desired = getattr(self, '_desired_thumb_order', None)
+            if not desired:
+                return
+            # build a map from basename -> widget
+            mapping = {}
+            for lbl in list(self.thumbnails):
+                fp = getattr(lbl, 'filepath', None)
+                if not fp:
+                    continue
+                mapping[os.path.basename(fp)] = lbl
+            new_list = []
+            for name in desired:
+                w = mapping.get(os.path.basename(name))
+                if w:
+                    new_list.append(w)
+            # append any remaining widgets not in desired order
+            for lbl in self.thumbnails:
+                if lbl not in new_list:
+                    new_list.append(lbl)
+            self.thumbnails = new_list
+            self._repack_thumbnails()
+        except Exception:
+            pass
+
+    def _rename_files_by_order(self):
+        """Safely rename image files to reflect the current thumbnail order.
+
+        This performs a two-phase rename using temporary names to avoid collisions.
+        Shows a confirmation dialog before performing destructive renaming.
+        """
+        try:
+            if not self.carpeta_salida:
+                return
+            if not self.thumbnails:
+                return
+            # Confirm
+            if not messagebox.askyesno('Confirmar renombrado', 'Renombrar los archivos para reflejar el nuevo orden? Esta acción modifica los nombres de archivo.'):
+                return
+            # Build new names based on title and index
+            sign = self.signatura_var.get().strip() or ''
+            title = self.titulo_var.get().strip() or 'escaneo'
+            # sanitize
+            def _sanitize(s):
+                return re.sub(r"[^A-Za-z0-9\-_ ]+", '', s).strip().replace(' ', '_')
+            sign_s = _sanitize(sign)
+            title_s = _sanitize(title)
+            new_names = []
+            for i, lbl in enumerate(self.thumbnails, start=1):
+                # try to preserve page suffix from original filename (_p1/_p2) if present
+                orig = os.path.basename(getattr(lbl, 'filepath', ''))
+                m = re.search(r"(_p\d+)(\.[^.]+)?$", orig)
+                page_suffix = m.group(1) if m else f"_p1"
+                ext = os.path.splitext(orig)[1] or '.png'
+                new_names.append(f"{sign_s}{title_s}_{i:03d}{page_suffix}{ext}")
+            # perform two-phase rename: move to .tmp names first
+            tmp_names = []
+            for lbl, new in zip(self.thumbnails, new_names):
+                old = getattr(lbl, 'filepath', None)
+                if not old or not os.path.exists(old):
+                    tmp_names.append((None, None))
+                    continue
+                tmp = os.path.join(self.carpeta_salida, new + '.tmp')
+                final = os.path.join(self.carpeta_salida, new)
+                try:
+                    os.replace(old, tmp)
+                    tmp_names.append((tmp, final))
+                except Exception:
+                    # abort: try to rollback any moved files
+                    for moved_tmp, moved_final in tmp_names:
+                        try:
+                            if moved_tmp and os.path.exists(moved_tmp):
+                                os.replace(moved_tmp, moved_final)
+                        except Exception:
+                            pass
+                    messagebox.showerror('Error', 'No se pudo renombrar los archivos. Operación abortada.')
+                    return
+            # commit phase: rename tmp -> final
+            for tmp, final in tmp_names:
+                if not tmp:
+                    continue
+                try:
+                    os.replace(tmp, final)
+                except Exception:
+                    # best-effort: continue
+                    pass
+            # update lbl.filepath for widgets
+            for lbl, new in zip(self.thumbnails, new_names):
+                try:
+                    lbl.filepath = os.path.join(self.carpeta_salida, new)
+                except Exception:
+                    pass
+            # save updated metadata
+            try:
+                self._save_folder_metadata()
+            except Exception:
+                pass
+            messagebox.showinfo('Renombrado', 'Renombrado completado.')
+        except Exception as e:
+            print('Error renombrando archivos por orden:', e)
 
     def _load_folder_metadata(self):
         path = self._folder_metadata_path()
