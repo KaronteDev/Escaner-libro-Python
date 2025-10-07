@@ -418,6 +418,22 @@ class BookScannerApp:
             fname = os.path.splitext(os.path.basename(ruta))[0]
             lbl_name = ttk.Label(container, text=fname, width=16, anchor='center')
             lbl_name.pack()
+            # show full filename on hover via tooltip
+            def _enter(e, label=lbl_name, fullpath=ruta):
+                try:
+                    # show tooltip with full filename (basename)
+                    self._show_tooltip(label, os.path.basename(fullpath))
+                except Exception:
+                    pass
+
+            def _leave(e, label=lbl_name):
+                try:
+                    self._hide_tooltip(label)
+                except Exception:
+                    pass
+
+            lbl_name.bind('<Enter>', _enter)
+            lbl_name.bind('<Leave>', _leave)
             # attach filepath on container for consistency
             container.filepath = ruta
             container.image_label = lbl_img
@@ -432,6 +448,38 @@ class BookScannerApp:
             container.bind('<B1-Motion>', lambda e, c=container: self._on_thumb_motion(e, c))
             container.bind('<ButtonRelease-1>', lambda e, c=container: self._on_thumb_release(e, c))
             self.thumbnails.append(container)
+        except Exception:
+            pass
+
+    def _show_tooltip(self, widget, text):
+        """Show a small tooltip near the widget with the given text."""
+        try:
+            # hide any existing tooltip for this widget
+            try:
+                if getattr(widget, '_tooltip_win', None):
+                    widget._tooltip_win.destroy()
+            except Exception:
+                pass
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            win = tk.Toplevel(self.root)
+            win.wm_overrideredirect(True)
+            win.wm_geometry(f"+{x}+{y}")
+            lbl = ttk.Label(win, text=text, background="#ffffe0", relief='solid', borderwidth=1)
+            lbl.pack(padx=4, pady=2)
+            widget._tooltip_win = win
+        except Exception:
+            pass
+
+    def _hide_tooltip(self, widget):
+        try:
+            win = getattr(widget, '_tooltip_win', None)
+            if win:
+                try:
+                    win.destroy()
+                except Exception:
+                    pass
+                widget._tooltip_win = None
         except Exception:
             pass
 
@@ -1349,6 +1397,7 @@ class BookScannerApp:
             data = {
                 'carpeta_salida': self.carpeta_salida,
                 'cam_index': self.cam_index,
+                'tmp_policy': getattr(self, 'tmp_policy_var', None) and self.tmp_policy_var.get() or 'ask',
             }
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1383,6 +1432,18 @@ class BookScannerApp:
             ci = data.get('cam_index')
             if isinstance(ci, int):
                 self.cam_index = ci
+            # restore tmp policy if present
+            try:
+                tp = data.get('tmp_policy')
+                if tp and getattr(self, 'tmp_policy_var', None) is not None:
+                    self.tmp_policy_var.set(tp)
+                    # ensure combobox reflects value
+                    try:
+                        self.tmp_policy_combo.set(tp)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception as e:
             print('Error cargando last session:', e)
 
