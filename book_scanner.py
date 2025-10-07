@@ -1,13 +1,15 @@
 import cv2
 import numpy as np
 import os
+import json
 import tkinter as tk
-from tkinter import ttk, messagebox, Scrollbar
+from tkinter import ttk, messagebox, Scrollbar, filedialog
 from PIL import Image, ImageTk
 import threading
 import time
 import datetime
 from PyPDF2 import PdfReader, PdfWriter
+import re
 
 
 # --- Image utility functions -------------------------------------------------
@@ -100,6 +102,11 @@ class BookScannerApp:
 
         # Start camera and capture thread
         self._enumerar_camaras()
+        # Load last session (if any) so user can continue working in previous folder
+        try:
+            self._load_last_session()
+        except Exception:
+            pass
         self._abrir_camara(self.cam_index)
         self._start_capture_thread()
 
@@ -126,11 +133,13 @@ class BookScannerApp:
         ttk.Label(frame_form, text="Archivo/Biblioteca:").pack(anchor="w", pady=(10, 0))
         ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
 
+
         # store buttons so we can enable/disable them during scanning
         self.btn_crear = ttk.Button(frame_form, text="📁 Crear carpeta", command=self.crear_carpeta)
         self.btn_crear.pack(fill="x", pady=(15, 0))
-        self.btn_capturar = ttk.Button(frame_form, text="📸 Escanear (Espacio)", command=self.escanear)
-        self.btn_capturar.pack(fill="x", pady=(10, 0))
+        # Open existing folder to continue working
+        self.btn_abrir = ttk.Button(frame_form, text="📂 Abrir carpeta", command=self.abrir_carpeta)
+        self.btn_abrir.pack(fill="x", pady=(8, 0))
         self.btn_export = ttk.Button(frame_form, text="🧾 Exportar a PDF", command=self.exportar_pdf)
         self.btn_export.pack(fill="x", pady=(10, 0))
         self.btn_reiniciar = ttk.Button(frame_form, text="🔁 Reiniciar cámara", command=self.reiniciar_camara)
@@ -141,13 +150,17 @@ class BookScannerApp:
         # Camera selector
         frame_cam = ttk.Frame(frame_form)
         frame_cam.pack(fill="x", pady=(10, 0))
-        ttk.Label(frame_cam, text="Cámara:").pack(side="left")
+        # use grid inside this small frame so we can place the capture button below the combobox
+        lbl_cam = ttk.Label(frame_cam, text="Cámara:")
+        lbl_cam.grid(row=0, column=0, sticky='w')
         self.cam_selector = ttk.Combobox(frame_cam, textvariable=self.cam_var, state="readonly", width=30)
-        self.cam_selector.pack(side="left", padx=(5, 0))
+        self.cam_selector.grid(row=0, column=1, sticky='w', padx=(5, 0))
         self.cam_selector.bind('<<ComboboxSelected>>', lambda e: self.cambiar_camara())
-        ttk.Button(frame_cam, text="Capturar", command=self.escanear).pack(side="left", padx=(8, 0))
+        # Capture button placed under the combobox; also expose as self.btn_capturar for _set_ui_enabled
+        self.btn_capturar = ttk.Button(frame_cam, text="📸 Capturar", command=self.escanear)
+        self.btn_capturar.grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky='w')
         self.split_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame_cam, text="Partir en 2", variable=self.split_var).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(frame_cam, text="Partir en 2", variable=self.split_var).grid(row=0, column=2, padx=(8, 0))
 
         # Right: video + gallery
         frame_video = ttk.Frame(self.root)
@@ -569,6 +582,12 @@ class BookScannerApp:
         self.carpeta_salida = os.path.join(os.getcwd(), signatura)
         os.makedirs(self.carpeta_salida, exist_ok=True)
         messagebox.showinfo("Carpeta creada", f"Las imágenes se guardarán en:\n{self.carpeta_salida}")
+        # save folder metadata and last session
+        try:
+            self._save_folder_metadata()
+            self._save_last_session()
+        except Exception:
+            pass
 
     def salir(self):
         self._running = False
@@ -581,6 +600,96 @@ class BookScannerApp:
             self.root.destroy()
         except Exception:
             pass
+
+    # ---------------- folder / metadata persistence -----------------------
+    def abrir_carpeta(self):
+        path = filedialog.askdirectory(title="Abrir carpeta de trabajo")
+        if not path:
+            return
+        # load metadata if exists
+        self.carpeta_salida = path
+        try:
+            self._load_folder_metadata()
+            self._save_last_session()
+            messagebox.showinfo("Carpeta abierta", f"Carpeta abierta:\n{self.carpeta_salida}")
+        except Exception as e:
+            print('Error al abrir carpeta:', e)
+
+    def _folder_metadata_path(self):
+        if not self.carpeta_salida:
+            return None
+        return os.path.join(self.carpeta_salida, 'metadata.json')
+
+    def _save_folder_metadata(self):
+        path = self._folder_metadata_path()
+        if not path:
+            return
+        data = {
+            'titulo': self.titulo_var.get().strip(),
+            'autor': self.autor_var.get().strip(),
+            'tema': self.tema_var.get().strip(),
+            'signatura': self.signatura_var.get().strip(),
+            'archivo': self.archivo_var.get().strip(),
+            'contador': self.contador,
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print('Error guardando metadata folder:', e)
+
+    def _load_folder_metadata(self):
+        path = self._folder_metadata_path()
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.titulo_var.set(data.get('titulo', ''))
+            self.autor_var.set(data.get('autor', ''))
+            self.tema_var.set(data.get('tema', ''))
+            self.signatura_var.set(data.get('signatura', ''))
+            self.archivo_var.set(data.get('archivo', ''))
+            self.contador = data.get('contador', self.contador)
+        except Exception as e:
+            print('Error cargando metadata folder:', e)
+
+    def _last_session_path(self):
+        # store a last-session file in the project folder
+        return os.path.join(os.getcwd(), '.last_session.json')
+
+    def _save_last_session(self):
+        try:
+            p = self._last_session_path()
+            data = {
+                'carpeta_salida': self.carpeta_salida,
+                'cam_index': self.cam_index,
+            }
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print('Error guardando last session:', e)
+
+    def _load_last_session(self):
+        try:
+            p = self._last_session_path()
+            if not os.path.exists(p):
+                return
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            last = data.get('carpeta_salida')
+            if last and os.path.isdir(last):
+                self.carpeta_salida = last
+                # try loading folder metadata
+                try:
+                    self._load_folder_metadata()
+                except Exception:
+                    pass
+            ci = data.get('cam_index')
+            if isinstance(ci, int):
+                self.cam_index = ci
+        except Exception as e:
+            print('Error cargando last session:', e)
 
 
 if __name__ == "__main__":
