@@ -165,12 +165,12 @@ class BookScannerApp:
         self.cam_selector.grid(row=0, column=1, sticky='w', padx=(5, 0))
         self.cam_selector.bind('<<ComboboxSelected>>', lambda e: self.cambiar_camara())
         # Capture button placed under the combobox; also expose as self.btn_capturar for _set_ui_enabled
-        self.btn_capturar = ttk.Button(frame_cam, text="📸 Capturar", command=self.escanear)
+        self.btn_capturar = ttk.Button(frame_cam, text="📸 Capturar", command=self.escanear,width=30)
         self.btn_capturar.grid(row=1, column=0, columnspan=4, pady=(6, 0), sticky='w')
         # BooleanVar doesn't have layout methods; create the variable and place
         # the Checkbutton in the grid instead.
         self.split_var = tk.BooleanVar(frame_cam, value=True)
-        ttk.Checkbutton(frame_cam, text="Partir en 2", variable=self.split_var).grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky='w')
+        ttk.Checkbutton(frame_cam, text="Partir en 2", variable=self.split_var,width=30).grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky='w')
 
         # Right: video + gallery
         frame_video = ttk.Frame(self.root)
@@ -216,6 +216,48 @@ class BookScannerApp:
                     v._autosave_trace_id = tid
                 except Exception:
                     pass
+        except Exception:
+            pass
+
+    def _clear_thumbnails(self):
+        try:
+            for w in list(self.thumbnails):
+                try:
+                    w.destroy()
+                except Exception:
+                    pass
+            self.thumbnails.clear()
+            # also clear any children inside frame_thumbs
+            try:
+                for child in list(self.frame_thumbs.winfo_children()):
+                    child.destroy()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _load_existing_thumbnails(self):
+        # populate the gallery with existing PNG files in carpeta_salida
+        try:
+            self._clear_thumbnails()
+            if not self.carpeta_salida or not os.path.isdir(self.carpeta_salida):
+                return
+            archivos = sorted([f for f in os.listdir(self.carpeta_salida) if f.lower().endswith('.png')])
+            for fn in archivos:
+                ruta = os.path.join(self.carpeta_salida, fn)
+                try:
+                    img = cv2.imread(ruta)
+                    if img is None:
+                        continue
+                    thumb = cv2.resize(img, (120, 160))
+                    thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+                    img_thumb = ImageTk.PhotoImage(Image.fromarray(thumb))
+                    lbl = ttk.Label(self.frame_thumbs, image=img_thumb)
+                    lbl.image = img_thumb
+                    lbl.pack(side="left", padx=5, pady=5)
+                    self.thumbnails.append(lbl)
+                except Exception:
+                    continue
         except Exception:
             pass
 
@@ -653,6 +695,11 @@ class BookScannerApp:
         try:
             self._save_folder_metadata()
             self._save_last_session()
+            # load any existing thumbnails (in case folder already had images)
+            try:
+                self._load_existing_thumbnails()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -677,6 +724,11 @@ class BookScannerApp:
         self.carpeta_salida = path
         try:
             self._load_folder_metadata()
+            # populate gallery with existing images
+            try:
+                self._load_existing_thumbnails()
+            except Exception:
+                pass
             self._save_last_session()
             messagebox.showinfo("Carpeta abierta", f"Carpeta abierta:\n{self.carpeta_salida}")
         except Exception as e:
@@ -743,6 +795,11 @@ class BookScannerApp:
                     self._last_saved_var.set("Metadatos guardados: -")
             except Exception:
                 pass
+            # once metadata loaded, populate gallery
+            try:
+                self._load_existing_thumbnails()
+            except Exception:
+                pass
         except Exception as e:
             print('Error cargando metadata folder:', e)
 
@@ -775,6 +832,11 @@ class BookScannerApp:
                 # try loading folder metadata
                 try:
                     self._load_folder_metadata()
+                except Exception:
+                    pass
+                # also populate gallery from any existing images even if metadata missing
+                try:
+                    self._load_existing_thumbnails()
                 except Exception:
                     pass
             ci = data.get('cam_index')
