@@ -25,7 +25,7 @@ def ordenar_puntos(pts):
     return rect
 
 
-def detectar_libro(frame, canny1=75, canny2=200, min_area=10000):
+def detectar_libro(frame, canny1=75, canny2=200, min_area=10000, aspect_weight=1.0, use_bright_fallback=True, debug=False):
     try:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     except Exception:
@@ -81,10 +81,30 @@ def detectar_libro(frame, canny1=75, canny2=200, min_area=10000):
                 return None
         except Exception:
             return None
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:32]
+    candidates = []
+    h_img, w_img = gray_eq.shape[:2]
+    # adaptive thresholds per-image (robust to lighting): derive from IQR and global std
+    try:
+        iqr = float(np.percentile(gray_eq, 75) - np.percentile(gray_eq, 25))
+        global_std = float(np.std(gray_eq))
+    except Exception:
+        iqr = 30.0
+        global_std = 50.0
+    # convert to sensible thresholds (guard with minima)
+    contrast_thresh = max(8.0, iqr * 0.12)
+    std_thresh = max(30.0, global_std * 1.2)
+    # adaptive kernel for ring dilation
+    dk = max(7, int(min(h_img, w_img) / 80))
+    try:
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dk, dk))
+    except Exception:
+        ring_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+
     for c in contours:
         try:
-            if cv2.contourArea(c) < min_area:
+            area = cv2.contourArea(c)
+            if area < min_area:
                 continue
             # smooth contour using convex hull to remove finger-like protrusions
             try:
@@ -93,14 +113,63 @@ def detectar_libro(frame, canny1=75, canny2=200, min_area=10000):
                 hull = c
             peri = cv2.arcLength(hull, True)
             approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+
+            # build mask for this candidate
+            mask = np.zeros(gray_eq.shape, dtype=np.uint8)
+            try:
+                cv2.drawContours(mask, [hull], -1, 255, -1)
+            except Exception:
+                try:
+                    cv2.drawContours(mask, [c], -1, 255, -1)
+                except Exception:
+                    continue
+
+            # compute interior mean and stddev — use an eroded inner mask to avoid dark text/edges
+            try:
+                # erosion to get a central area (reduce influence of margins and text)
+                ek = max(3, int(min(h_img, w_img) / 200))
+                inner = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ek, ek)), iterations=2)
+                if np.any(inner > 0):
+                    mean_in = float(cv2.mean(gray_eq, mask=inner)[0])
+                    _, std_in = cv2.meanStdDev(gray_eq, mask=inner)
+                    std_in = float(std_in[0][0])
+                else:
+                    mean_in = float(cv2.mean(gray_eq, mask=mask)[0])
+                    _, std_in = cv2.meanStdDev(gray_eq, mask=mask)
+                    std_in = float(std_in[0][0])
+            except Exception:
+                mean_in = float(np.mean(gray_eq[mask > 0])) if np.any(mask > 0) else 0.0
+                std_in = float(np.std(gray_eq[mask > 0])) if np.any(mask > 0) else 255.0
+
+            # compute ring mean (dilated mask minus eroded inner area) — sample immediate surroundings
+            try:
+                dil = cv2.dilate(mask, ring_kernel, iterations=1)
+                # exclude interior center if available
+                try:
+                    inner = inner  # from above
+                except Exception:
+                    inner = None
+                if inner is not None and np.any(inner > 0):
+                    ring = cv2.bitwise_and(dil, cv2.bitwise_not(inner))
+                else:
+                    ring = cv2.bitwise_and(dil, cv2.bitwise_not(mask))
+                mean_ring = float(cv2.mean(gray_eq, mask=ring)[0]) if np.any(ring > 0) else 0.0
+            except Exception:
+                mean_ring = 0.0
+
+            # contrast: page tends to be brighter than surroundings
+            contrast = mean_in - mean_ring
+
+            # heuristics: prefer large areas with positive contrast and low interior variance
+            # (contrast_thresh and std_thresh adapted per-image above)
+
+            # compute candidate pts (prefer polygon if 4 vertices, fallback to extremes)
             pts = None
             if len(approx) == 4:
                 pts = approx.reshape(4, 2)
             else:
-                # fallback: try to select 4 extreme points from hull
                 try:
                     pts_all = hull.reshape(-1, 2)
-                    # pick extremes: tl, tr, br, bl by sums and diffs
                     sums = pts_all.sum(axis=1)
                     diffs = np.diff(pts_all, axis=1).reshape(-1)
                     tl = pts_all[np.argmin(sums)]
@@ -110,10 +179,93 @@ def detectar_libro(frame, canny1=75, canny2=200, min_area=10000):
                     pts = np.vstack([tl, tr, br, bl])
                 except Exception:
                     pts = None
-            if pts is not None:
-                return pts
+
+            # aspect ratio heuristic: pages usually have a tall-ish rectangle (e.g. ~1.2-1.6)
+            try:
+                bx, by, bw, bh = cv2.boundingRect(hull)
+                if bh > 0:
+                    ar = float(bw) / float(bh)
+                else:
+                    ar = 1.0
+            except Exception:
+                ar = 1.0
+            # expected aspect ratio (width/height) for a page; tuned for typical book pages
+            expected_ar = 1.4
+            # ar_score in [0,1], higher when close to expected_ar
+            ar_score = max(0.0, 1.0 - abs(ar - expected_ar) / expected_ar)
+
+            # scoring: reward contrast and area, include aspect ratio term, penalize high internal variance
+            score = contrast * (area / (w_img * h_img)) + (float(aspect_weight) * ar_score) - 0.5 * std_in
+
+            # require minimal criteria: positive contrast and not too noisy
+            area_frac = float(area) / float(w_img * h_img)
+            if contrast >= contrast_thresh and std_in <= std_thresh and pts is not None:
+                candidates.append((score, pts))
+            else:
+                # keep as lower-priority candidate if area is huge and pts present
+                if pts is not None and area > (w_img * h_img * 0.5):
+                    candidates.append((score * 0.5, pts))
+                else:
+                    # fallback: sometimes reflections or lighting make the ring brighter than the page
+                    # accept candidates that are reasonably bright, large enough, and have a good aspect-ratio match
+                    if pts is not None and mean_in >= 120.0 and area_frac >= 0.12 and ar_score >= 0.6 and std_in <= (std_thresh * 1.6):
+                        candidates.append((score * 0.7, pts))
+                    else:
+                        continue
         except Exception:
             continue
+
+    if candidates:
+        # choose best-scoring candidate
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best = candidates[0][1]
+        if debug:
+            # build a summary list for debugging: score, area fraction, aspect ratio, contrast
+            dbg = []
+            for sc, pts in candidates:
+                try:
+                    # compute bounding rect and area
+                    bx, by, bw, bh = cv2.boundingRect(np.array(pts, dtype=np.int32))
+                    area = bw * bh
+                    ar = float(bw) / float(bh) if bh > 0 else 1.0
+                except Exception:
+                    area = 0
+                    ar = 1.0
+                dbg.append({'score': float(sc), 'area': int(area), 'ar': float(ar), 'pts': pts.tolist() if hasattr(pts, 'tolist') else pts})
+            return best, dbg
+        return best
+    # fallback: try finding a large bright connected region (useful when ring/contrast heuristics fail)
+    try:
+        # Otsu threshold to separate bright page from darker background
+        _, th = cv2.threshold(gray_eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # morphological open/close to remove noise and small text holes
+        mk = cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, int(min(h_img, w_img)/150)),) * 2)
+        thf = cv2.morphologyEx(th, cv2.MORPH_OPEN, mk)
+        thf = cv2.morphologyEx(thf, cv2.MORPH_CLOSE, mk)
+        contours2, _ = cv2.findContours(thf, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours2:
+            contours2 = sorted(contours2, key=cv2.contourArea, reverse=True)
+            for c in contours2[:6]:
+                a = cv2.contourArea(c)
+                if a < (w_img * h_img * 0.03):
+                    continue
+                bx, by, bw, bh = cv2.boundingRect(c)
+                ar = float(bw) / float(bh) if bh > 0 else 1.0
+                # Accept if aspect ratio within 0.6..1.8 (covers landscape/portrait small skew)
+                if 0.6 <= (ar if ar>0 else 1.0) <= 1.8:
+                    # try to approximate polygon to 4 points
+                    peri = cv2.arcLength(c, True)
+                    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                    if len(approx) == 4:
+                        pts = approx.reshape(4, 2)
+                    else:
+                        pts = np.array([[bx,by],[bx+bw,by],[bx+bw,by+bh],[bx,by+bh]], dtype=np.float32)
+                    if debug:
+                        return pts, [{'score': float(a), 'area': int(a), 'ar': float(ar), 'pts': pts.tolist()}]
+                    return pts
+    except Exception:
+        pass
+    return None
     return None
 
 
@@ -299,9 +451,106 @@ class BookScannerApp:
         self.actualizar_video()
 
     def crear_interfaz(self):
-        frame_form = ttk.LabelFrame(self.root, text="Datos del documento", padding=10)
-        frame_form.pack(side="left", fill="y", padx=10, pady=10)
+        # Left column: create a scrollable area for the form (use a canvas + scrollbar)
+        left_outer = ttk.Frame(self.root)
+        left_outer.pack(side="left", fill="y", padx=10, pady=10)
+        left_canvas = tk.Canvas(left_outer, borderwidth=0, highlightthickness=0, width=360)
+        left_scroll = ttk.Scrollbar(left_outer, orient='vertical', command=left_canvas.yview)
+        left_canvas.configure(yscrollcommand=left_scroll.set)
+        left_canvas.pack(side='left', fill='y', expand=False)
+        left_scroll.pack(side='right', fill='y')
+        form_container = ttk.Frame(left_canvas)
+        # ensure scrollregion updates
+        form_container.bind('<Configure>', lambda e: left_canvas.configure(scrollregion=left_canvas.bbox('all')))
+        left_canvas.create_window((0, 0), window=form_container, anchor='nw')
+
+        frame_form = ttk.LabelFrame(form_container, text="Datos del documento", padding=10)
+        frame_form.pack(side="top", fill="x", padx=0, pady=0)
         self.frame_form = frame_form
+
+        # helper: add collapse/expand toggle to a LabelFrame by wrapping header
+        def make_collapsible(parent, title=None):
+            # title is optional so callers may create the frame and configure text later
+            lf = ttk.LabelFrame(parent, text=(title if title is not None else ""))
+            # store a hidden flag
+            lf._collapsed = False
+            lf._hidden_children = []
+            def toggle():
+                try:
+                    if lf._collapsed:
+                        for w, pack_info in getattr(lf, '_hidden_children', []):
+                            try:
+                                # restore using stored pack options when available
+                                w.pack(**(pack_info or {}))
+                            except Exception:
+                                try:
+                                    w.pack()
+                                except Exception:
+                                    pass
+                        lf._hidden_children = []
+                        lf._collapsed = False
+                        try:
+                            lf._btn.configure(text='▾')
+                        except Exception:
+                            pass
+                    else:
+                        # hide current children but keep the toggle button visible
+                        childs = [c for c in lf.winfo_children() if c is not getattr(lf, '_btn', None)]
+                        store = []
+                        for w in childs:
+                            try:
+                                # capture simple pack info if available
+                                info = None
+                                try:
+                                    info = w.pack_info()
+                                except Exception:
+                                    info = None
+                                try:
+                                    w.pack_forget()
+                                except Exception:
+                                    pass
+                                store.append((w, info))
+                            except Exception:
+                                pass
+                        lf._hidden_children = store
+                        lf._collapsed = True
+                        try:
+                            lf._btn.configure(text='▸')
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # small button in top-right to toggle; we'll place it so it stays visible when collapsing
+            try:
+                btn = ttk.Button(lf, text='▾', width=2, command=toggle)
+                lf._btn = btn
+                # attempt to place the button anchored to the top-right of the labelframe
+                try:
+                    # a small offset to keep button inside the border
+                    btn.place(in_=lf, relx=1.0, x=-6, y=6, anchor='ne')
+                except Exception:
+                    # fallback: pack top-right (may appear in child list and be hidden)
+                    try:
+                        btn.pack(side='right')
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return lf
+
+        # group main controls into labeled sections
+        meta_frame = make_collapsible(frame_form)
+        meta_frame.configure(text='Metadatos')
+        meta_frame.pack(fill='x', pady=(4,6))
+        thumb_frame = make_collapsible(frame_form)
+        thumb_frame.configure(text='Miniaturas')
+        thumb_frame.pack(fill='x', pady=(4,6))
+        det_frame = make_collapsible(frame_form)
+        det_frame.configure(text='Detección y limpieza')
+        det_frame.pack(fill='x', pady=(4,6))
+        cam_frame = make_collapsible(frame_form)
+        cam_frame.configure(text='Cámara')
+        cam_frame.pack(fill='x', pady=(4,6))
 
         # selection style for thumbnails
         try:
@@ -312,95 +561,105 @@ class BookScannerApp:
         except Exception:
             pass
 
-        ttk.Label(frame_form, text="Título del libro:").pack(anchor="w")
-        ttk.Entry(frame_form, textvariable=self.titulo_var).pack(fill="x")
+        ttk.Label(meta_frame, text="Título del libro:").pack(anchor="w")
+        ttk.Entry(meta_frame, textvariable=self.titulo_var).pack(fill="x")
 
-        ttk.Label(frame_form, text="Autor:").pack(anchor="w", pady=(10, 0))
-        ttk.Entry(frame_form, textvariable=self.autor_var).pack(fill="x")
+        ttk.Label(meta_frame, text="Autor:").pack(anchor="w", pady=(10, 0))
+        ttk.Entry(meta_frame, textvariable=self.autor_var).pack(fill="x")
 
-        ttk.Label(frame_form, text="Tema investigación:").pack(anchor="w", pady=(10, 0))
-        ttk.Entry(frame_form, textvariable=self.tema_var).pack(fill="x")
+        ttk.Label(meta_frame, text="Tema investigación:").pack(anchor="w", pady=(10, 0))
+        ttk.Entry(meta_frame, textvariable=self.tema_var).pack(fill="x")
 
-        ttk.Label(frame_form, text="Signatura:").pack(anchor="w", pady=(10, 0))
-        ttk.Entry(frame_form, textvariable=self.signatura_var).pack(fill="x")
+        ttk.Label(meta_frame, text="Signatura:").pack(anchor="w", pady=(10, 0))
+        ttk.Entry(meta_frame, textvariable=self.signatura_var).pack(fill="x")
 
-        ttk.Label(frame_form, text="Archivo/Biblioteca:").pack(anchor="w", pady=(10, 0))
+        ttk.Label(meta_frame, text="Archivo/Biblioteca:").pack(anchor="w", pady=(10, 0))
 
-        ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
+        ttk.Entry(meta_frame, textvariable=self.archivo_var).pack(fill="x")
         
         # store buttons so we can enable/disable them during scanning
-        self.btn_crear = ttk.Button(frame_form, text="📁 Crear carpeta", command=self.crear_carpeta)
-        self.btn_crear.pack(fill="x", pady=(15, 0))
+        self.btn_crear = ttk.Button(meta_frame, text="📁 Crear carpeta", command=self.crear_carpeta)
+        self.btn_crear.pack(fill="x", pady=(10, 0))
         # Open existing folder to continue working
-        self.btn_abrir = ttk.Button(frame_form, text="📂 Abrir carpeta", command=self.abrir_carpeta)
-        self.btn_abrir.pack(fill="x", pady=(8, 0))
-        self.btn_export = ttk.Button(frame_form, text="🧾 Exportar a PDF", command=self.exportar_pdf)
-        self.btn_export.pack(fill="x", pady=(10, 0))
-        self.btn_reiniciar = ttk.Button(frame_form, text="🔁 Reiniciar cámara", command=self.reiniciar_camara)
-        self.btn_reiniciar.pack(fill="x", pady=(10, 0))
-        self.btn_salir = ttk.Button(frame_form, text="❌ Salir", command=self.salir)
-        self.btn_salir.pack(fill="x", pady=(10, 0))
+        self.btn_abrir = ttk.Button(meta_frame, text="📂 Abrir carpeta", command=self.abrir_carpeta)
+        self.btn_abrir.pack(fill="x", pady=(6, 0))
+        self.btn_export = ttk.Button(meta_frame, text="🧾 Exportar a PDF", command=self.exportar_pdf)
+        self.btn_export.pack(fill="x", pady=(6, 0))
+        self.btn_reiniciar = ttk.Button(meta_frame, text="🔁 Reiniciar cámara", command=self.reiniciar_camara)
+        self.btn_reiniciar.pack(fill="x", pady=(6, 0))
+        self.btn_salir = ttk.Button(meta_frame, text="❌ Salir", command=self.salir)
+        self.btn_salir.pack(fill="x", pady=(6, 0))
         
         
         # Auto-save metadata option
         self.autosave_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(meta_frame, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
 
         # Thumbnail size controls
-        ttk.Label(frame_form, text="Tamaño miniatura (px):").pack(anchor="w", pady=(8, 0))
+        ttk.Label(thumb_frame, text="Tamaño miniatura (px):").pack(anchor="w", pady=(8, 0))
         self.thumb_w_var = tk.IntVar(value=120)
         self.thumb_h_var = tk.IntVar(value=160)
-        size_frame = ttk.Frame(frame_form)
+        size_frame = ttk.Frame(thumb_frame)
         size_frame.pack(fill="x")
         tk.Spinbox(size_frame, from_=60, to=400, textvariable=self.thumb_w_var, width=6).pack(side="left")
         ttk.Label(size_frame, text="x").pack(side="left", padx=4)
         tk.Spinbox(size_frame, from_=60, to=400, textvariable=self.thumb_h_var, width=6).pack(side="left")
         ttk.Button(size_frame, text="Aplicar", command=lambda: (self._load_existing_thumbnails())).pack(side="left", padx=8)
-        # Detection tuning
-        ttk.Label(frame_form, text="Detección y limpieza:").pack(anchor='w', pady=(8,0))
+        # Detection tuning (in detection frame)
         self.skin_thresh_var = tk.IntVar(value=25)
-        ttk.Label(frame_form, text="Umbral piel (Cr range):").pack(anchor='w')
-        ttk.Scale(frame_form, from_=10, to=60, variable=self.skin_thresh_var, orient='horizontal').pack(fill='x')
+        ttk.Label(det_frame, text="Umbral piel (Cr range):").pack(anchor='w')
+        ttk.Scale(det_frame, from_=10, to=60, variable=self.skin_thresh_var, orient='horizontal').pack(fill='x')
         self.morph_kernel_var = tk.IntVar(value=9)
-        ttk.Label(frame_form, text="Kernel morfología: ").pack(anchor='w')
-        ttk.Scale(frame_form, from_=3, to=31, variable=self.morph_kernel_var, orient='horizontal').pack(fill='x')
+        ttk.Label(det_frame, text="Kernel morfología: ").pack(anchor='w')
+        ttk.Scale(det_frame, from_=3, to=31, variable=self.morph_kernel_var, orient='horizontal').pack(fill='x')
         self.min_area_var = tk.IntVar(value=10000)
-        ttk.Label(frame_form, text="Área mínima contorno:").pack(anchor='w')
-        tk.Spinbox(frame_form, from_=1000, to=200000, increment=500, textvariable=self.min_area_var).pack(fill='x')
+        ttk.Label(det_frame, text="Área mínima contorno:").pack(anchor='w')
+        tk.Spinbox(det_frame, from_=1000, to=200000, increment=500, textvariable=self.min_area_var).pack(fill='x')
+        # aspect ratio weight for scoring
+        self.aspect_ratio_weight = tk.DoubleVar(value=1.0)
+        ttk.Label(det_frame, text="Peso heurística proporción (aspect ratio):").pack(anchor='w', pady=(6,0))
+        ttk.Scale(det_frame, from_=0.0, to=3.0, variable=self.aspect_ratio_weight, orient='horizontal').pack(fill='x')
+        # bright-region fallback toggle
+        self.use_bright_fallback_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(det_frame, text='Usar fallback región brillante', variable=self.use_bright_fallback_var).pack(anchor='w', pady=(6,0))
+        # debug overlay controls
+        self.debug_det_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(det_frame, text='Debug detección (mostrar scores)', variable=self.debug_det_var).pack(anchor='w', pady=(6,0))
+        self.debug_topn_var = tk.IntVar(value=4)
+        ttk.Label(det_frame, text='Top N candidatos a mostrar:').pack(anchor='w')
+        tk.Spinbox(det_frame, from_=1, to=12, textvariable=self.debug_topn_var, width=6).pack(anchor='w')
         # curvature correction
         self.curvature_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frame_form, text="Corregir curvatura (experimental)", variable=self.curvature_var).pack(fill='x', pady=(6,0))
+        ttk.Checkbutton(det_frame, text="Corregir curvatura (experimental)", variable=self.curvature_var).pack(fill='x', pady=(6,0))
         # curvature intensity slider
         self.curvature_intensity_var = tk.DoubleVar(value=0.8)
-        ttk.Label(frame_form, text="Intensidad curvatura:").pack(anchor='w')
-        ttk.Scale(frame_form, from_=0.0, to=2.0, variable=self.curvature_intensity_var, orient='horizontal').pack(fill='x')
+        ttk.Label(det_frame, text="Intensidad curvatura:").pack(anchor='w')
+        ttk.Scale(det_frame, from_=0.0, to=2.0, variable=self.curvature_intensity_var, orient='horizontal').pack(fill='x')
         # mesh density for advanced unwarp (number of control columns)
         self.curvature_mesh_cols_var = tk.IntVar(value=40)
-        ttk.Label(frame_form, text="Densidad malla (columnas):").pack(anchor='w')
-        tk.Spinbox(frame_form, from_=8, to=200, increment=2, textvariable=self.curvature_mesh_cols_var).pack(fill='x')
+        ttk.Label(det_frame, text="Densidad malla (columnas):").pack(anchor='w')
+        tk.Spinbox(det_frame, from_=8, to=200, increment=2, textvariable=self.curvature_mesh_cols_var).pack(fill='x')
         # Optionally rename files to preserve order when reordering
         self.rename_on_reorder_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame_form, text="Renombrar archivos al reordenar", variable=self.rename_on_reorder_var).pack(fill="x", pady=(6, 0))
+        ttk.Checkbutton(thumb_frame, text="Renombrar archivos al reordenar", variable=self.rename_on_reorder_var).pack(fill="x", pady=(6, 0))
 
         # Undo last rename (backup) button
-        self.btn_undo_rename = ttk.Button(frame_form, text="↶ Deshacer renombrado", command=self._undo_last_rename)
+        self.btn_undo_rename = ttk.Button(meta_frame, text="↶ Deshacer renombrado", command=self._undo_last_rename)
         self.btn_undo_rename.pack(fill="x", pady=(6, 0))
 
         # .tmp policy control (ask / commit / delete)
-        ttk.Label(frame_form, text="Política archivos .tmp:").pack(anchor='w', pady=(8,0))
+        ttk.Label(det_frame, text="Política archivos .tmp:").pack(anchor='w', pady=(8,0))
         self.tmp_policy_var = tk.StringVar(value='Preguntar')
-        self.tmp_policy_combo = ttk.Combobox(frame_form, textvariable=self.tmp_policy_var, state='readonly', values=['Preguntar','Realizar','Borrar'])
+        self.tmp_policy_combo = ttk.Combobox(det_frame, textvariable=self.tmp_policy_var, state='readonly', values=['Preguntar','Realizar','Borrar'])
         self.tmp_policy_combo.pack(fill='x')
 
         # Last-saved indicator
         self._last_saved_var = tk.StringVar(value="Metadatos guardados: -")
-        ttk.Label(frame_form, textvariable=self._last_saved_var, foreground="#2e7d32").pack(fill="x", pady=(4, 0))
+        ttk.Label(meta_frame, textvariable=self._last_saved_var, foreground="#2e7d32").pack(fill="x", pady=(4, 0))
 
-      
-
-        # Camera selector
-        frame_cam = ttk.Frame(frame_form)
-        frame_cam.pack(fill="x", pady=(10, 0))
+        # Camera selector (placed inside cam_frame)
+        frame_cam = ttk.Frame(cam_frame)
+        frame_cam.pack(fill="x", pady=(4, 0))
         # use grid inside this small frame so we can place the capture button below the combobox
         lbl_cam = ttk.Label(frame_cam, text="Cámara:")
         lbl_cam.grid(row=0, column=0, sticky='w')
@@ -443,6 +702,7 @@ class BookScannerApp:
         self.frame_thumbs.bind("<Configure>", lambda e: self.canvas_gallery.configure(scrollregion=self.canvas_gallery.bbox("all")))
 
         self.root.bind("<space>", lambda e: self.escanear())
+
 
         # keyboard navigation for thumbnails
         try:
@@ -1411,10 +1671,49 @@ class BookScannerApp:
         if frame is not None:
             try:
                 display = frame.copy()
-                puntos = detectar_libro(frame)
+                try:
+                    aw = getattr(self, 'aspect_ratio_weight', None) and float(self.aspect_ratio_weight.get()) or 1.0
+                    ma = getattr(self, 'min_area_var', None) and int(self.min_area_var.get()) or 10000
+                    use_bf = getattr(self, 'use_bright_fallback_var', None) and bool(self.use_bright_fallback_var.get())
+                    debug_on = getattr(self, 'debug_det_var', None) and bool(self.debug_det_var.get())
+                    topn = getattr(self, 'debug_topn_var', None) and int(self.debug_topn_var.get()) or 4
+                except Exception:
+                    aw = 1.0
+                    ma = 10000
+                    use_bf = True
+                    debug_on = False
+                    topn = 4
+
+                det_res = detectar_libro(frame, min_area=ma, aspect_weight=aw, use_bright_fallback=use_bf, debug=debug_on)
+                puntos = None
+                candidates_dbg = None
+                if debug_on and isinstance(det_res, tuple):
+                    try:
+                        puntos, candidates_dbg = det_res
+                    except Exception:
+                        puntos = det_res
+                else:
+                    puntos = det_res
+
                 if puntos is not None:
                     try:
                         cv2.polylines(display, [np.int32(puntos)], True, (0, 255, 0), 3)
+                    except Exception:
+                        pass
+                # draw debug overlays for top candidates (if provided)
+                if debug_on and candidates_dbg:
+                    try:
+                        for i, c in enumerate(candidates_dbg[:topn]):
+                            pts_c = np.array(c.get('pts', []), dtype=np.int32)
+                            scr = c.get('score', 0.0)
+                            if pts_c.size:
+                                try:
+                                    cv2.polylines(display, [pts_c], True, (0, 180, 255), 2)
+                                    # draw score text near first point
+                                    x, y = int(pts_c[0][0]), int(pts_c[0][1])
+                                    cv2.putText(display, f"{scr:.1f}", (x+4, y+12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
 
@@ -1524,7 +1823,22 @@ class BookScannerApp:
                     min_area = int(getattr(self, 'min_area_var', tk.IntVar(value=10000)).get())
                 except Exception:
                     min_area = 10000
-                pts = detectar_libro(imagen, min_area=min_area)
+                try:
+                    aw = getattr(self, 'aspect_ratio_weight', None) and float(self.aspect_ratio_weight.get()) or 1.0
+                    use_bf = getattr(self, 'use_bright_fallback_var', None) and bool(self.use_bright_fallback_var.get())
+                    debug_on = getattr(self, 'debug_det_var', None) and bool(self.debug_det_var.get())
+                except Exception:
+                    aw = 1.0
+                    use_bf = True
+                    debug_on = False
+                det_res = detectar_libro(imagen, min_area=min_area, aspect_weight=aw, use_bright_fallback=use_bf, debug=debug_on)
+                if debug_on and isinstance(det_res, tuple):
+                    try:
+                        pts, dbg = det_res
+                    except Exception:
+                        pts = det_res
+                else:
+                    pts = det_res
                 if pts is not None:
                     break
                 # try a quicker adaptive-threshold fallback
@@ -1553,6 +1867,48 @@ class BookScannerApp:
                         pass
                 except Exception:
                     imagen_proc = imagen
+                # if debug was requested, save overlay + candidates info for this scan
+                try:
+                    if debug_on:
+                        try:
+                            outdir = os.path.join(os.getcwd(), 'output', 'temp_test')
+                            os.makedirs(outdir, exist_ok=True)
+                            # build overlay from original display-size image
+                            overlay = imagen.copy()
+                            # draw detected polygon
+                            try:
+                                cv2.polylines(overlay, [np.int32(pts)], True, (0, 255, 0), 3)
+                            except Exception:
+                                pass
+                            # draw candidate polygons if dbg present
+                            try:
+                                if 'dbg' in locals() and isinstance(dbg, list):
+                                    for i, c in enumerate(dbg):
+                                        try:
+                                            pts_c = np.array(c.get('pts', []), dtype=np.int32)
+                                            score = c.get('score', 0.0)
+                                            if pts_c.size:
+                                                cv2.polylines(overlay, [pts_c], True, (0, 180, 255), 2)
+                                                x, y = int(pts_c[0][0]), int(pts_c[0][1])
+                                                cv2.putText(overlay, f"{score:.1f}", (x+4, y+12), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                            debug_img_path = os.path.join(outdir, f"scan_debug_{ts}.jpg")
+                            cv2.imwrite(debug_img_path, overlay)
+                            # save candidates JSON
+                            try:
+                                dbg_info = {'detected_pts': pts.tolist() if hasattr(pts, 'tolist') else None, 'candidates': dbg if isinstance(dbg, list) else None, 'timestamp': ts}
+                                with open(os.path.join(outdir, f"scan_debug_{ts}.json"), 'w', encoding='utf-8') as jf:
+                                    json.dump(dbg_info, jf, ensure_ascii=False, indent=2)
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             else:
                 h, w = imagen.shape[:2]
                 pad_w = int(w * 0.05)
@@ -2021,6 +2377,13 @@ class BookScannerApp:
                 'carpeta_salida': self.carpeta_salida,
                 'cam_index': self.cam_index,
                 'tmp_policy': getattr(self, 'tmp_policy_var', None) and self.tmp_policy_var.get() or 'ask',
+                # detection UI settings
+                'detection': {
+                    'aspect_ratio_weight': getattr(self, 'aspect_ratio_weight', None) and float(self.aspect_ratio_weight.get()) or 1.0,
+                    'use_bright_fallback': getattr(self, 'use_bright_fallback_var', None) and bool(self.use_bright_fallback_var.get()) or False,
+                    'min_area': getattr(self, 'min_area_var', None) and int(self.min_area_var.get()) or 10000,
+                    'debug_det': getattr(self, 'debug_det_var', None) and bool(self.debug_det_var.get()) or False
+                }
             }
             with open(p, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2063,6 +2426,36 @@ class BookScannerApp:
                     # ensure combobox reflects value
                     try:
                         self.tmp_policy_combo.set(tp)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # restore detection UI settings if present
+            try:
+                det = data.get('detection')
+                if det:
+                    try:
+                        arw = det.get('aspect_ratio_weight')
+                        if arw is not None and getattr(self, 'aspect_ratio_weight', None) is not None:
+                            self.aspect_ratio_weight.set(float(arw))
+                    except Exception:
+                        pass
+                    try:
+                        ubf = det.get('use_bright_fallback')
+                        if ubf is not None and getattr(self, 'use_bright_fallback_var', None) is not None:
+                            self.use_bright_fallback_var.set(bool(ubf))
+                    except Exception:
+                        pass
+                    try:
+                        ma = det.get('min_area')
+                        if ma is not None and getattr(self, 'min_area_var', None) is not None:
+                            self.min_area_var.set(int(ma))
+                    except Exception:
+                        pass
+                    try:
+                        dbg = det.get('debug_det')
+                        if dbg is not None and getattr(self, 'debug_det_var', None) is not None:
+                            self.debug_det_var.set(bool(dbg))
                     except Exception:
                         pass
             except Exception:
