@@ -172,8 +172,8 @@ class BookScannerApp:
 
         # .tmp policy control (ask / commit / delete)
         ttk.Label(frame_form, text="Política archivos .tmp:").pack(anchor='w', pady=(8,0))
-        self.tmp_policy_var = tk.StringVar(value='ask')
-        self.tmp_policy_combo = ttk.Combobox(frame_form, textvariable=self.tmp_policy_var, state='readonly', values=['ask','commit','delete'])
+        self.tmp_policy_var = tk.StringVar(value='Preguntar')
+        self.tmp_policy_combo = ttk.Combobox(frame_form, textvariable=self.tmp_policy_var, state='readonly', values=['Preguntar','Realizar','Borrar'])
         self.tmp_policy_combo.pack(fill='x')
 
         # Last-saved indicator
@@ -277,15 +277,15 @@ class BookScannerApp:
             if not tmps:
                 return
             # decide policy
-            policy = getattr(self, 'tmp_policy_var', None) and self.tmp_policy_var.get() or 'ask'
-            if policy == 'delete':
+            policy = getattr(self, 'tmp_policy_var', None) and self.tmp_policy_var.get() or 'Preguntar'
+            if policy == 'Borrar':
                 for t in tmps:
                     try:
                         os.remove(os.path.join(self.carpeta_salida, t))
                     except Exception:
                         pass
                 return
-            elif policy == 'commit':
+            elif policy == 'Realizar':
                 do_commit = True
             else:
                 # Ask user what to do
