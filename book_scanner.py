@@ -131,12 +131,16 @@ class BookScannerApp:
         ttk.Entry(frame_form, textvariable=self.signatura_var).pack(fill="x")
 
         ttk.Label(frame_form, text="Archivo/Biblioteca:").pack(anchor="w", pady=(10, 0))
-        ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
 
+        ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
+        
         # Auto-save metadata option
         self.autosave_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
 
+        # Last-saved indicator
+        self._last_saved_var = tk.StringVar(value="Metadatos guardados: -")
+        ttk.Label(frame_form, textvariable=self._last_saved_var, foreground="#2e7d32").pack(fill="x", pady=(4, 0))
 
         # store buttons so we can enable/disable them during scanning
         self.btn_crear = ttk.Button(frame_form, text="📁 Crear carpeta", command=self.crear_carpeta)
@@ -162,9 +166,11 @@ class BookScannerApp:
         self.cam_selector.bind('<<ComboboxSelected>>', lambda e: self.cambiar_camara())
         # Capture button placed under the combobox; also expose as self.btn_capturar for _set_ui_enabled
         self.btn_capturar = ttk.Button(frame_cam, text="📸 Capturar", command=self.escanear)
-        self.btn_capturar.grid(row=1, column=0, columnspan=2, pady=(6, 0), sticky='w')
-        self.split_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame_cam, text="Partir en 2", variable=self.split_var).grid(row=0, column=2, padx=(8, 0))
+        self.btn_capturar.grid(row=1, column=0, columnspan=4, pady=(6, 0), sticky='w')
+        # BooleanVar doesn't have layout methods; create the variable and place
+        # the Checkbutton in the grid instead.
+        self.split_var = tk.BooleanVar(frame_cam, value=True)
+        ttk.Checkbutton(frame_cam, text="Partir en 2", variable=self.split_var).grid(row=2, column=0, columnspan=2, pady=(6, 0), sticky='w')
 
         # Right: video + gallery
         frame_video = ttk.Frame(self.root)
@@ -191,7 +197,13 @@ class BookScannerApp:
 
         self.root.bind("<space>", lambda e: self.escanear())
 
-        # install traces to auto-save metadata on change
+        # bind middle mouse button on preview to capture (Button-2 on Windows)
+        try:
+            self.lbl_video.bind('<Button-2>', lambda e: self.escanear())
+        except Exception:
+            pass
+
+        # install traces to auto-save metadata on change (immediate save)
         try:
             for v in (self.titulo_var, self.autor_var, self.tema_var, self.signatura_var, self.archivo_var):
                 # remove existing traces if present
@@ -199,7 +211,7 @@ class BookScannerApp:
                     v.trace_vdelete('w', v._autosave_trace_id)
                 except Exception:
                     pass
-                tid = v.trace_add('write', self._on_metadata_changed)
+                tid = v.trace_add('write', lambda *a, vv=v: (self._save_folder_metadata() if getattr(self, 'autosave_var', None) and self.autosave_var.get() else None))
                 try:
                     v._autosave_trace_id = tid
                 except Exception:
@@ -444,9 +456,14 @@ class BookScannerApp:
 
     # ---------------- scan / save -------------------------------------------
     def escanear(self):
+        # Check folder first to avoid showing modal dialogs while holding frame_lock
+        if not self.carpeta_salida:
+            messagebox.showwarning("Atención", "Primero cree la carpeta de salida y espere la vista previa.")
+            return
+
         with self.frame_lock:
-            if self.frame_actual is None or not self.carpeta_salida:
-                messagebox.showwarning("Atención", "Primero cree la carpeta de salida y espere la vista previa.")
+            if self.frame_actual is None:
+                messagebox.showwarning("Atención", "Espere a que aparezca la vista previa antes de escanear.")
                 return
             imagen = self.frame_actual.copy()
 
@@ -682,9 +699,24 @@ class BookScannerApp:
             'archivo': self.archivo_var.get().strip(),
             'contador': self.contador,
         }
+        # persist timestamp
+        try:
+            now = datetime.datetime.now().isoformat()
+            data['last_saved'] = now
+        except Exception:
+            data['last_saved'] = None
         try:
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            # update UI label
+            try:
+                if data.get('last_saved'):
+                    ts = datetime.datetime.fromisoformat(data['last_saved']).strftime('%H:%M:%S')
+                    self._last_saved_var.set(f"Metadatos guardados: {ts}")
+                else:
+                    self._last_saved_var.set("Metadatos guardados: -")
+            except Exception:
+                pass
         except Exception as e:
             print('Error guardando metadata folder:', e)
 
@@ -701,6 +733,16 @@ class BookScannerApp:
             self.signatura_var.set(data.get('signatura', ''))
             self.archivo_var.set(data.get('archivo', ''))
             self.contador = data.get('contador', self.contador)
+            # restore last_saved indicator
+            try:
+                ls = data.get('last_saved')
+                if ls:
+                    ts = datetime.datetime.fromisoformat(ls).strftime('%H:%M:%S')
+                    self._last_saved_var.set(f"Metadatos guardados: {ts}")
+                else:
+                    self._last_saved_var.set("Metadatos guardados: -")
+            except Exception:
+                pass
         except Exception as e:
             print('Error cargando metadata folder:', e)
 
