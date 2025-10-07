@@ -166,6 +166,16 @@ class BookScannerApp:
         self.rename_on_reorder_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(frame_form, text="Renombrar archivos al reordenar", variable=self.rename_on_reorder_var).pack(fill="x", pady=(6, 0))
 
+        # Undo last rename (backup) button
+        self.btn_undo_rename = ttk.Button(frame_form, text="↶ Deshacer renombrado", command=self._undo_last_rename)
+        self.btn_undo_rename.pack(fill="x", pady=(6, 0))
+
+        # .tmp policy control (ask / commit / delete)
+        ttk.Label(frame_form, text="Política archivos .tmp:").pack(anchor='w', pady=(8,0))
+        self.tmp_policy_var = tk.StringVar(value='ask')
+        self.tmp_policy_combo = ttk.Combobox(frame_form, textvariable=self.tmp_policy_var, state='readonly', values=['ask','commit','delete'])
+        self.tmp_policy_combo.pack(fill='x')
+
         # Last-saved indicator
         self._last_saved_var = tk.StringVar(value="Metadatos guardados: -")
         ttk.Label(frame_form, textvariable=self._last_saved_var, foreground="#2e7d32").pack(fill="x", pady=(4, 0))
@@ -255,6 +265,56 @@ class BookScannerApp:
             except Exception:
                 pass
             # preserve any desired order marker (set by _load_folder_metadata) - do not reset here
+        except Exception:
+            pass
+
+    def _cleanup_tmp_files(self):
+        """Scan carpeta_salida for .tmp files left by interrupted operations and offer to recover or delete them."""
+        try:
+            if not self.carpeta_salida or not os.path.isdir(self.carpeta_salida):
+                return
+            tmps = [f for f in os.listdir(self.carpeta_salida) if f.endswith('.tmp')]
+            if not tmps:
+                return
+            # decide policy
+            policy = getattr(self, 'tmp_policy_var', None) and self.tmp_policy_var.get() or 'ask'
+            if policy == 'delete':
+                for t in tmps:
+                    try:
+                        os.remove(os.path.join(self.carpeta_salida, t))
+                    except Exception:
+                        pass
+                return
+            elif policy == 'commit':
+                do_commit = True
+            else:
+                # Ask user what to do
+                do_commit = messagebox.askyesno('Archivos temporales encontrados', f'Se han encontrado {len(tmps)} archivos .tmp en la carpeta. ¿Desea intentar completar los renombrados pendientes? (No = eliminar .tmp)')
+                if not do_commit:
+                    for t in tmps:
+                        try:
+                            os.remove(os.path.join(self.carpeta_salida, t))
+                        except Exception:
+                            pass
+                    return
+            # try to commit tmp -> final (remove .tmp suffix)
+            for t in tmps:
+                tmp_path = os.path.join(self.carpeta_salida, t)
+                final = tmp_path[:-4]
+                try:
+                    # if final exists, skip and remove tmp
+                    if os.path.exists(final):
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+                        continue
+                    os.replace(tmp_path, final)
+                except Exception:
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -350,19 +410,28 @@ class BookScannerApp:
     def _add_thumbnail_from_pil(self, pil_img, ruta):
         try:
             img_tk = ImageTk.PhotoImage(pil_img)
-            lbl = ttk.Label(self.frame_thumbs, image=img_tk)
-            lbl.image = img_tk
-            lbl.filepath = ruta
-            lbl.pack(side="left", padx=5, pady=5)
-            # left click opens preview
-            lbl.bind('<Button-1>', lambda e, r=ruta: self._open_preview(r))
-            # right click shows context menu
-            lbl.bind('<Button-3>', lambda e, l=lbl: self._show_thumb_menu(e, l))
-            # drag-and-drop bindings
-            lbl.bind('<ButtonPress-1>', lambda e, l=lbl: self._on_thumb_press(e, l))
-            lbl.bind('<B1-Motion>', lambda e, l=lbl: self._on_thumb_motion(e, l))
-            lbl.bind('<ButtonRelease-1>', lambda e, l=lbl: self._on_thumb_release(e, l))
-            self.thumbnails.append(lbl)
+            container = ttk.Frame(self.frame_thumbs)
+            lbl_img = ttk.Label(container, image=img_tk)
+            lbl_img.image = img_tk
+            lbl_img.pack()
+            # filename label (no extension)
+            fname = os.path.splitext(os.path.basename(ruta))[0]
+            lbl_name = ttk.Label(container, text=fname, width=16, anchor='center')
+            lbl_name.pack()
+            # attach filepath on container for consistency
+            container.filepath = ruta
+            container.image_label = lbl_img
+            container.name_label = lbl_name
+            container.pack(side="left", padx=5, pady=5)
+            # left click opens preview (bind on image label)
+            lbl_img.bind('<Button-1>', lambda e, r=ruta: self._open_preview(r))
+            # right click shows context menu (bind on container)
+            container.bind('<Button-3>', lambda e, c=container: self._show_thumb_menu(e, c))
+            # drag-and-drop bindings (bind on container)
+            container.bind('<ButtonPress-1>', lambda e, c=container: self._on_thumb_press(e, c))
+            container.bind('<B1-Motion>', lambda e, c=container: self._on_thumb_motion(e, c))
+            container.bind('<ButtonRelease-1>', lambda e, c=container: self._on_thumb_release(e, c))
+            self.thumbnails.append(container)
         except Exception:
             pass
 
@@ -905,13 +974,10 @@ class BookScannerApp:
             def add_thumbs():
                 for ruta, pag_save in saved:
                     try:
-                        thumb = cv2.resize(pag_save, (120, 160))
+                        thumb = cv2.resize(pag_save, (int(self.thumb_w_var.get()), int(self.thumb_h_var.get())))
                         thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-                        img_thumb = ImageTk.PhotoImage(Image.fromarray(thumb))
-                        lbl = ttk.Label(self.frame_thumbs, image=img_thumb)
-                        lbl.image = img_thumb
-                        lbl.pack(side="left", padx=5, pady=5)
-                        self.thumbnails.append(lbl)
+                        pil_img = Image.fromarray(thumb)
+                        self._add_thumbnail_from_pil(pil_img, ruta)
                         print(f"Guardado: {ruta}")
                     except Exception as e:
                         print('Error creando miniatura:', e)
@@ -970,6 +1036,11 @@ class BookScannerApp:
         messagebox.showinfo("Carpeta creada", f"Las imágenes se guardarán en:\n{self.carpeta_salida}")
         # save folder metadata and last session
         try:
+            # cleanup any leftover tmp files from previous interrupted operations
+            try:
+                self._cleanup_tmp_files()
+            except Exception:
+                pass
             self._save_folder_metadata()
             self._save_last_session()
             # load any existing thumbnails (in case folder already had images)
@@ -1000,6 +1071,11 @@ class BookScannerApp:
         # load metadata if exists
         self.carpeta_salida = path
         try:
+            # cleanup any leftover tmp files
+            try:
+                self._cleanup_tmp_files()
+            except Exception:
+                pass
             self._load_folder_metadata()
             # populate gallery with existing images
             try:
@@ -1115,16 +1191,20 @@ class BookScannerApp:
                 new_names.append(f"{sign_s}{title_s}_{i:03d}{page_suffix}{ext}")
             # perform two-phase rename: move to .tmp names first
             tmp_names = []
+            # backup mapping old->new for undo
+            backup = []
             for lbl, new in zip(self.thumbnails, new_names):
                 old = getattr(lbl, 'filepath', None)
                 if not old or not os.path.exists(old):
                     tmp_names.append((None, None))
+                    backup.append((old, None))
                     continue
                 tmp = os.path.join(self.carpeta_salida, new + '.tmp')
                 final = os.path.join(self.carpeta_salida, new)
                 try:
                     os.replace(old, tmp)
                     tmp_names.append((tmp, final))
+                    backup.append((final, old))
                 except Exception:
                     # abort: try to rollback any moved files
                     for moved_tmp, moved_final in tmp_names:
@@ -1144,6 +1224,25 @@ class BookScannerApp:
                 except Exception:
                     # best-effort: continue
                     pass
+            # persist backup mapping to metadata for undo
+            try:
+                mdpath = self._folder_metadata_path()
+                if mdpath and os.path.exists(mdpath):
+                    try:
+                        with open(mdpath, 'r', encoding='utf-8') as mf:
+                            mdata = json.load(mf)
+                    except Exception:
+                        mdata = {}
+                else:
+                    mdata = {}
+                mdata['last_rename_backup'] = [{'new': n, 'old': o} for (n, o) in backup if n or o]
+                try:
+                    with open(mdpath, 'w', encoding='utf-8') as mf:
+                        json.dump(mdata, mf, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # update lbl.filepath for widgets
             for lbl, new in zip(self.thumbnails, new_names):
                 try:
@@ -1158,6 +1257,56 @@ class BookScannerApp:
             messagebox.showinfo('Renombrado', 'Renombrado completado.')
         except Exception as e:
             print('Error renombrando archivos por orden:', e)
+
+    def _undo_last_rename(self):
+        try:
+            mdpath = self._folder_metadata_path()
+            if not mdpath or not os.path.exists(mdpath):
+                messagebox.showinfo('Deshacer', 'No hay respaldo para deshacer.')
+                return
+            with open(mdpath, 'r', encoding='utf-8') as mf:
+                mdata = json.load(mf)
+            backup = mdata.get('last_rename_backup')
+            if not backup:
+                messagebox.showinfo('Deshacer', 'No hay respaldo para deshacer.')
+                return
+            # ask confirm
+            if not messagebox.askyesno('Deshacer renombrado', '¿Desea revertir el último renombrado?'):
+                return
+            # perform reverse mapping new->old
+            for item in reversed(backup):
+                new = item.get('new')
+                old = item.get('old')
+                if not new or not old:
+                    continue
+                new_path = os.path.join(self.carpeta_salida, os.path.basename(new))
+                old_path = os.path.join(self.carpeta_salida, os.path.basename(old))
+                try:
+                    if os.path.exists(new_path):
+                        # if old exists, create unique backup name
+                        if os.path.exists(old_path):
+                            try:
+                                os.remove(old_path)
+                            except Exception:
+                                pass
+                        os.replace(new_path, old_path)
+                except Exception:
+                    pass
+            # clear backup entry
+            try:
+                mdata['last_rename_backup'] = []
+                with open(mdpath, 'w', encoding='utf-8') as mf:
+                    json.dump(mdata, mf, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+            # refresh gallery
+            try:
+                self._load_existing_thumbnails()
+            except Exception:
+                pass
+            messagebox.showinfo('Deshacer', 'Operación de deshacer completada.')
+        except Exception as e:
+            print('Error deshaciendo renombrado:', e)
 
     def _load_folder_metadata(self):
         path = self._folder_metadata_path()
@@ -1223,6 +1372,11 @@ class BookScannerApp:
                     pass
                 # also populate gallery from any existing images even if metadata missing
                 try:
+                    # cleanup any leftover tmp files before loading
+                    try:
+                        self._cleanup_tmp_files()
+                    except Exception:
+                        pass
                     self._load_existing_thumbnails()
                 except Exception:
                     pass
