@@ -5,5 +5,19 @@
   "signatura": "cc",
   "archivo": "cc",
   "contador": 1,
-  "last_saved": "2025-10-07T21:49:10.265045"
+  "order": [
+    "bbbb_001_p2.png",
+    "bbbb_002_p1.png",
+    "bbbb_003_p2.png",
+    "bbbb_004_p1.png",
+    "bbbb_005_p1.png",
+    "bbbb_006_p1.png",
+    "bbbb_007_p2.png",
+    "bbbb_008_p2.png",
+    "bbbb_009_p1.png",
+    "bbbb_010_p1.png",
+    "bbbb_011_p1.png",
+    "bbbb_012_p1.png"
+  ],
+  "last_saved": "2025-10-07T22:55:11.837151"
 }

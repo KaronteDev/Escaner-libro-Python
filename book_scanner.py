@@ -30,17 +30,90 @@ def detectar_libro(frame, canny1=75, canny2=200, min_area=10000):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     except Exception:
         return None
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # improve contrast locally
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply(gray)
+    except Exception:
+        gray_eq = gray
+
+    blur = cv2.GaussianBlur(gray_eq, (5, 5), 0)
     edges = cv2.Canny(blur, canny1, canny2)
+
+    # attempt to remove skin/fingers from edges (simple YCrCb threshold)
+    try:
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        # common skin color range in YCrCb (may vary). This masks likely skin regions.
+        skin_mask = cv2.inRange(ycrcb, np.array((0, 133, 77), dtype=np.uint8), np.array((255, 173, 127), dtype=np.uint8))
+        # invert skin mask so we keep non-skin areas
+        non_skin = cv2.bitwise_not(skin_mask)
+        # make non_skin binary 0/255 and combine with edges
+        try:
+            non_skin_bin = (non_skin > 0).astype('uint8') * 255
+            edges = cv2.bitwise_and(edges, non_skin_bin)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # morphological closing to fill gaps and smooth small protrusions
+    try:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+    except Exception:
+        pass
+
     contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:8]
+    if not contours:
+        # fallback: try bright-region detection (page tends to be brighter than background)
+        try:
+            # use adaptive threshold to isolate bright areas
+            th = cv2.adaptiveThreshold(gray_eq, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 51, -10)
+            # invert so bright areas are white
+            th_inv = cv2.bitwise_not(th)
+            # morphological open to remove small noise
+            mk = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+            thf = cv2.morphologyEx(th_inv, cv2.MORPH_OPEN, mk)
+            contours2, _ = cv2.findContours(thf, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours2:
+                contours = sorted(contours2, key=cv2.contourArea, reverse=True)[:12]
+            else:
+                return None
+        except Exception:
+            return None
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:12]
     for c in contours:
-        if cv2.contourArea(c) < min_area:
+        try:
+            if cv2.contourArea(c) < min_area:
+                continue
+            # smooth contour using convex hull to remove finger-like protrusions
+            try:
+                hull = cv2.convexHull(c)
+            except Exception:
+                hull = c
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.02 * peri, True)
+            pts = None
+            if len(approx) == 4:
+                pts = approx.reshape(4, 2)
+            else:
+                # fallback: try to select 4 extreme points from hull
+                try:
+                    pts_all = hull.reshape(-1, 2)
+                    # pick extremes: tl, tr, br, bl by sums and diffs
+                    sums = pts_all.sum(axis=1)
+                    diffs = np.diff(pts_all, axis=1).reshape(-1)
+                    tl = pts_all[np.argmin(sums)]
+                    br = pts_all[np.argmax(sums)]
+                    tr = pts_all[np.argmin(diffs)]
+                    bl = pts_all[np.argmax(diffs)]
+                    pts = np.vstack([tl, tr, br, bl])
+                except Exception:
+                    pts = None
+            if pts is not None:
+                return pts
+        except Exception:
             continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2)
     return None
 
 
@@ -53,7 +126,8 @@ def four_point_transform(image, pts):
     altoA = np.linalg.norm(tr - br)
     altoB = np.linalg.norm(tl - bl)
     maxAlto = int(max(altoA, altoB))
-    dst = np.array([[0, 0], [0, maxAlto - 1], [maxAncho - 1, maxAlto - 1], [maxAncho - 1, 0]], dtype="float32")
+    # correct destination ordering: tl, tr, br, bl
+    dst = np.array([[0, 0], [maxAncho - 1, 0], [maxAncho - 1, maxAlto - 1], [0, maxAlto - 1]], dtype="float32")
     M = cv2.getPerspectiveTransform(rect, dst)
     return cv2.warpPerspective(image, M, (maxAncho, maxAlto))
 
@@ -62,6 +136,115 @@ def separar_paginas(imagen):
     h, w = imagen.shape[:2]
     mitad = w // 2
     return imagen[:, :mitad], imagen[:, mitad:]
+
+
+def mesh_unwarp(image, intensity=0.8):
+    """Perform a mesh-based horizontal unwarp to reduce book curvature.
+
+    Parameters:
+    - image: BGR numpy array
+    - intensity: float, how strong the unwarp should be (0.0 no-op, ~1.0 default)
+
+    This builds a per-column displacement field (vectorized) and applies cv2.remap.
+    """
+    try:
+        if intensity is None or intensity <= 0:
+            return image
+        h, w = image.shape[:2]
+        # grayscale projection to find dark spine region
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            cx = w // 2
+            strip = gray[:, max(0, cx - w // 6): min(w, cx + w // 6)]
+            v = np.mean(strip.astype(np.float32), axis=0)
+            min_idx = int(np.argmin(v))
+            spine_x = max(0, cx - w // 6 + min_idx)
+        except Exception:
+            spine_x = w // 2
+
+        # normalized coordinate grid
+        xs = np.arange(w, dtype=np.float32)
+        # distance from spine normalized [-1,1]
+        dx = (xs - spine_x) / float(w)
+
+        # profile: cubic-like displacement that is zero at edges and max near spine
+        # amplitude proportional to width and intensity
+        max_shift = float(w) * 0.06 * float(np.clip(intensity, 0.0, 3.0))
+        # use a smooth cubic curve: shift = sign(dx) * (1 - (1-|dx|)^3) * max_shift
+        ad = np.abs(dx)
+        profile = (1.0 - np.power(1.0 - np.clip(ad, 0.0, 1.0), 3.0))
+        shift_x = -np.sign(dx) * profile * max_shift
+
+        # create full map by repeating per row; optionally taper effect towards top/bottom
+        # vertical taper to reduce edge stretching
+        ys = np.arange(h, dtype=np.float32)
+        vy = 1.0 - 0.3 * ((ys - h/2.0)/(h/2.0))**2  # gentle quadratic taper
+        vy = np.clip(vy, 0.6, 1.0)
+
+        map_x = np.empty((h, w), dtype=np.float32)
+        map_y = np.empty((h, w), dtype=np.float32)
+        for i, vyv in enumerate(vy):
+            map_x[i, :] = np.clip(xs + shift_x * vyv, 0, w - 1)
+            map_y[i, :] = i
+
+        unwarped = cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return unwarped
+    except Exception:
+        return image
+
+
+def mesh_unwarp_advanced(image, cols=40, intensity=0.8):
+    """Advanced mesh remapping: build a coarse mesh of control columns and interpolate per-pixel displacement.
+
+    - cols: number of vertical control columns (coarse). Higher -> more precise but slower.
+    - intensity: multiplier for displacement.
+    """
+    try:
+        if intensity is None or intensity <= 0:
+            return image
+        h, w = image.shape[:2]
+        cols = int(max(4, min(cols, w)))
+
+        # estimate spine position
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            cx = w // 2
+            strip = gray[:, max(0, cx - w // 6): min(w, cx + w // 6)]
+            v = np.mean(strip.astype(np.float32), axis=0)
+            min_idx = int(np.argmin(v))
+            spine_x = max(0, cx - w // 6 + min_idx)
+        except Exception:
+            spine_x = w // 2
+
+        # control column x positions
+        ctrl_x = np.linspace(0, w - 1, num=cols, dtype=np.float32)
+        # compute displacement for each control column (same profile idea as mesh_unwarp)
+        dx = (ctrl_x - spine_x) / float(w)
+        ad = np.abs(dx)
+        profile = (1.0 - np.power(1.0 - np.clip(ad, 0.0, 1.0), 3.0))
+        max_shift = float(w) * 0.06 * float(np.clip(intensity, 0.0, 3.0))
+        shift_ctrl = -np.sign(dx) * profile * max_shift
+
+        # Build per-pixel shift by linear interpolation of control columns
+        xs = np.arange(w, dtype=np.float32)
+        # interpolate shift_ctrl defined at ctrl_x to every xs
+        shift_full = np.interp(xs, ctrl_x, shift_ctrl)
+
+        # vertical taper (reduce near top/bottom)
+        ys = np.arange(h, dtype=np.float32)
+        vy = 1.0 - 0.4 * ((ys - h/2.0)/(h/2.0))**2
+        vy = np.clip(vy, 0.4, 1.0)
+
+        map_x = np.empty((h, w), dtype=np.float32)
+        map_y = np.empty((h, w), dtype=np.float32)
+        for i, vyv in enumerate(vy):
+            map_x[i, :] = np.clip(xs + shift_full * vyv, 0, w - 1)
+            map_y[i, :] = i
+
+        unwarped = cv2.remap(image, map_x, map_y, interpolation=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        return unwarped
+    except Exception:
+        return image
 
 
 # --- Application --------------------------------------------------------------
@@ -88,6 +271,8 @@ class BookScannerApp:
         self.carpeta_salida = ""
         self.contador = 1
         self.thumbnails = []
+        # debug flag to help diagnose drag issues
+        self._debug_drag = False
 
         # Form vars
         self.titulo_var = tk.StringVar()
@@ -117,6 +302,15 @@ class BookScannerApp:
         frame_form = ttk.LabelFrame(self.root, text="Datos del documento", padding=10)
         frame_form.pack(side="left", fill="y", padx=10, pady=10)
         self.frame_form = frame_form
+
+        # selection style for thumbnails
+        try:
+            style = ttk.Style(self.root)
+            # define selected frame style with a visible border / background
+            style.configure('Selected.TFrame', background='#d0e7ff')
+            style.configure('Selected.TLabel', background='#d0e7ff')
+        except Exception:
+            pass
 
         ttk.Label(frame_form, text="Título del libro:").pack(anchor="w")
         ttk.Entry(frame_form, textvariable=self.titulo_var).pack(fill="x")
@@ -162,8 +356,30 @@ class BookScannerApp:
         ttk.Label(size_frame, text="x").pack(side="left", padx=4)
         tk.Spinbox(size_frame, from_=60, to=400, textvariable=self.thumb_h_var, width=6).pack(side="left")
         ttk.Button(size_frame, text="Aplicar", command=lambda: (self._load_existing_thumbnails())).pack(side="left", padx=8)
+        # Detection tuning
+        ttk.Label(frame_form, text="Detección y limpieza:").pack(anchor='w', pady=(8,0))
+        self.skin_thresh_var = tk.IntVar(value=25)
+        ttk.Label(frame_form, text="Umbral piel (Cr range):").pack(anchor='w')
+        ttk.Scale(frame_form, from_=10, to=60, variable=self.skin_thresh_var, orient='horizontal').pack(fill='x')
+        self.morph_kernel_var = tk.IntVar(value=9)
+        ttk.Label(frame_form, text="Kernel morfología: ").pack(anchor='w')
+        ttk.Scale(frame_form, from_=3, to=31, variable=self.morph_kernel_var, orient='horizontal').pack(fill='x')
+        self.min_area_var = tk.IntVar(value=10000)
+        ttk.Label(frame_form, text="Área mínima contorno:").pack(anchor='w')
+        tk.Spinbox(frame_form, from_=1000, to=200000, increment=500, textvariable=self.min_area_var).pack(fill='x')
+        # curvature correction
+        self.curvature_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame_form, text="Corregir curvatura (experimental)", variable=self.curvature_var).pack(fill='x', pady=(6,0))
+        # curvature intensity slider
+        self.curvature_intensity_var = tk.DoubleVar(value=0.8)
+        ttk.Label(frame_form, text="Intensidad curvatura:").pack(anchor='w')
+        ttk.Scale(frame_form, from_=0.0, to=2.0, variable=self.curvature_intensity_var, orient='horizontal').pack(fill='x')
+        # mesh density for advanced unwarp (number of control columns)
+        self.curvature_mesh_cols_var = tk.IntVar(value=40)
+        ttk.Label(frame_form, text="Densidad malla (columnas):").pack(anchor='w')
+        tk.Spinbox(frame_form, from_=8, to=200, increment=2, textvariable=self.curvature_mesh_cols_var).pack(fill='x')
         # Optionally rename files to preserve order when reordering
-        self.rename_on_reorder_var = tk.BooleanVar(value=False)
+        self.rename_on_reorder_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frame_form, text="Renombrar archivos al reordenar", variable=self.rename_on_reorder_var).pack(fill="x", pady=(6, 0))
 
         # Undo last rename (backup) button
@@ -227,6 +443,19 @@ class BookScannerApp:
         self.frame_thumbs.bind("<Configure>", lambda e: self.canvas_gallery.configure(scrollregion=self.canvas_gallery.bbox("all")))
 
         self.root.bind("<space>", lambda e: self.escanear())
+
+        # keyboard navigation for thumbnails
+        try:
+            self.root.bind('<Right>', lambda e: self._select_next_thumb(e))
+            self.root.bind('<Left>', lambda e: self._select_prev_thumb(e))
+        except Exception:
+            pass
+        # Enter to open, Delete to remove selected thumbnail
+        try:
+            self.root.bind('<Return>', lambda e: self._open_selected_preview())
+            self.root.bind('<Delete>', lambda e: self._delete_selected_thumb())
+        except Exception:
+            pass
 
         # bind middle mouse button on preview to capture (Button-2 on Windows)
         try:
@@ -410,13 +639,16 @@ class BookScannerApp:
     def _add_thumbnail_from_pil(self, pil_img, ruta):
         try:
             img_tk = ImageTk.PhotoImage(pil_img)
-            container = ttk.Frame(self.frame_thumbs)
-            lbl_img = ttk.Label(container, image=img_tk)
+            # use tk.Frame and tk.Label so we can change bg/relief for selection
+            container = tk.Frame(self.frame_thumbs, bd=0, relief='flat')
+            lbl_img = tk.Label(container, image=img_tk, bd=0)
             lbl_img.image = img_tk
+            # expose image on container so drag ghost can show it
+            container.image = img_tk
             lbl_img.pack()
             # filename label (no extension)
             fname = os.path.splitext(os.path.basename(ruta))[0]
-            lbl_name = ttk.Label(container, text=fname, width=16, anchor='center')
+            lbl_name = tk.Label(container, text=fname, width=16, anchor='center')
             lbl_name.pack()
             # show full filename on hover via tooltip
             def _enter(e, label=lbl_name, fullpath=ruta):
@@ -437,16 +669,28 @@ class BookScannerApp:
             # attach filepath on container for consistency
             container.filepath = ruta
             container.image_label = lbl_img
+            # remember last known image in case fallback is required
+            try:
+                self.last_known_thumb_image = img_tk
+            except Exception:
+                pass
             container.name_label = lbl_name
             container.pack(side="left", padx=5, pady=5)
-            # left click opens preview (bind on image label)
-            lbl_img.bind('<Button-1>', lambda e, r=ruta: self._open_preview(r))
+            # double-click opens preview (bind on image label and container)
+            lbl_img.bind('<Double-1>', lambda e, r=ruta: self._open_preview(r))
+            container.bind('<Double-1>', lambda e, r=ruta: self._open_preview(r))
             # right click shows context menu (bind on container)
             container.bind('<Button-3>', lambda e, c=container: self._show_thumb_menu(e, c))
-            # drag-and-drop bindings (bind on container)
+            # drag-and-drop bindings (bind on container, image and name so clicks on them work)
             container.bind('<ButtonPress-1>', lambda e, c=container: self._on_thumb_press(e, c))
             container.bind('<B1-Motion>', lambda e, c=container: self._on_thumb_motion(e, c))
             container.bind('<ButtonRelease-1>', lambda e, c=container: self._on_thumb_release(e, c))
+            lbl_img.bind('<ButtonPress-1>', lambda e, c=container: self._on_thumb_press(e, c))
+            lbl_img.bind('<B1-Motion>', lambda e, c=container: self._on_thumb_motion(e, c))
+            lbl_img.bind('<ButtonRelease-1>', lambda e, c=container: self._on_thumb_release(e, c))
+            lbl_name.bind('<ButtonPress-1>', lambda e, c=container: self._on_thumb_press(e, c))
+            lbl_name.bind('<B1-Motion>', lambda e, c=container: self._on_thumb_motion(e, c))
+            lbl_name.bind('<ButtonRelease-1>', lambda e, c=container: self._on_thumb_release(e, c))
             self.thumbnails.append(container)
         except Exception:
             pass
@@ -490,6 +734,184 @@ class BookScannerApp:
         except Exception:
             pass
 
+    def _set_selected_thumb(self, lbl):
+        """Visually mark a thumbnail as selected and unmark previous."""
+        try:
+            prev = getattr(self, '_selected_thumb', None)
+            if prev is not None and prev is not lbl:
+                try:
+                    # restore previous look for tk.Frame
+                    try:
+                        prev.configure(bg=self.frame_thumbs.cget('bg'), relief='flat', bd=0)
+                    except Exception:
+                        prev.configure(style='TFrame')
+                except Exception:
+                    try:
+                        prev['relief'] = 'flat'
+                    except Exception:
+                        pass
+            # mark new
+            try:
+                # for tk.Frame change bg and border
+                lbl.configure(bg='#d0e7ff', relief='solid', bd=2)
+                # also update child labels background
+                try:
+                    for child in lbl.winfo_children():
+                        try:
+                            child.configure(bg='#d0e7ff')
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    lbl.configure(style='Selected.TFrame')
+                except Exception:
+                    try:
+                        lbl['relief'] = 'solid'
+                    except Exception:
+                        pass
+            self._selected_thumb = lbl
+        except Exception:
+            pass
+
+    def _start_selection_pulse(self, lbl):
+        """Start a small pulsing effect on the selected thumbnail."""
+        try:
+            # cancel previous
+            try:
+                prev_id = getattr(self, '_selection_after_id', None)
+                if prev_id:
+                    self.root.after_cancel(prev_id)
+            except Exception:
+                pass
+            # initialize state
+            self._pulse_state = 0
+            def _pulse():
+                try:
+                    if not getattr(self, '_selected_thumb', None) is lbl:
+                        return
+                    # toggle bd and bg tint
+                    try:
+                        if getattr(self, '_pulse_state', 0) == 0:
+                            lbl.configure(bg='#c6e0ff', bd=3)
+                            for child in lbl.winfo_children():
+                                try:
+                                    child.configure(bg='#c6e0ff')
+                                except Exception:
+                                    pass
+                            self._pulse_state = 1
+                        else:
+                            lbl.configure(bg='#d0e7ff', bd=2)
+                            for child in lbl.winfo_children():
+                                try:
+                                    child.configure(bg='#d0e7ff')
+                                except Exception:
+                                    pass
+                            self._pulse_state = 0
+                    except Exception:
+                        pass
+                    self._selection_after_id = self.root.after(350, _pulse)
+                except Exception:
+                    pass
+            _pulse()
+        except Exception:
+            pass
+
+    def _stop_selection_pulse(self, lbl):
+        try:
+            aid = getattr(self, '_selection_after_id', None)
+            if aid:
+                try:
+                    self.root.after_cancel(aid)
+                except Exception:
+                    pass
+            try:
+                # restore look
+                lbl.configure(bg=self.frame_thumbs.cget('bg'), relief='flat', bd=0)
+                for child in lbl.winfo_children():
+                    try:
+                        child.configure(bg=self.frame_thumbs.cget('bg'))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _open_selected_preview(self):
+        try:
+            sel = getattr(self, '_selected_thumb', None)
+            if not sel:
+                return
+            ruta = getattr(sel, 'filepath', None)
+            if ruta and os.path.exists(ruta):
+                self._open_preview(ruta)
+        except Exception:
+            pass
+
+    def _delete_selected_thumb(self):
+        try:
+            sel = getattr(self, '_selected_thumb', None)
+            if not sel:
+                return
+            # confirm and delete
+            if messagebox.askyesno('Confirmar', '¿Eliminar la miniatura seleccionada?'):
+                try:
+                    self._delete_thumb(sel)
+                    self._selected_thumb = None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _select_next_thumb(self, event=None):
+        try:
+            if not self.thumbnails:
+                return
+            cur = getattr(self, '_selected_thumb', None)
+            if cur is None:
+                self._set_selected_thumb(self.thumbnails[0])
+                return
+            try:
+                idx = self.thumbnails.index(cur)
+            except Exception:
+                idx = 0
+            nxt = min(len(self.thumbnails) - 1, idx + 1)
+            if nxt != idx:
+                self._set_selected_thumb(self.thumbnails[nxt])
+                # scroll canvas to make visible
+                try:
+                    widget = self.thumbnails[nxt]
+                    self.canvas_gallery.xview_moveto(max(0, widget.winfo_x() / max(1, self.frame_thumbs.winfo_width())))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _select_prev_thumb(self, event=None):
+        try:
+            if not self.thumbnails:
+                return
+            cur = getattr(self, '_selected_thumb', None)
+            if cur is None:
+                self._set_selected_thumb(self.thumbnails[0])
+                return
+            try:
+                idx = self.thumbnails.index(cur)
+            except Exception:
+                idx = 0
+            prv = max(0, idx - 1)
+            if prv != idx:
+                self._set_selected_thumb(self.thumbnails[prv])
+                try:
+                    widget = self.thumbnails[prv]
+                    self.canvas_gallery.xview_moveto(max(0, widget.winfo_x() / max(1, self.frame_thumbs.winfo_width())))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _on_thumb_motion(self, event, lbl):
         try:
             if not hasattr(self, '_drag_data') or self._drag_data.get('widget') is None:
@@ -499,7 +921,37 @@ class BookScannerApp:
                 try:
                     self._drag_ghost = tk.Toplevel(self.root)
                     self._drag_ghost.overrideredirect(True)
-                    img = lbl.image
+                    # Robustly find a PhotoImage to show in the ghost.
+                    img = None
+                    # 1) direct on container
+                    try:
+                        img = getattr(lbl, 'image', None)
+                    except Exception:
+                        img = None
+                    # 2) label child saved as image_label
+                    if img is None:
+                        try:
+                            img = getattr(lbl, 'image_label', None) and getattr(lbl.image_label, 'image', None)
+                        except Exception:
+                            img = None
+                    # 3) scan children for a label with .image attribute
+                    if img is None:
+                        try:
+                            for child in lbl.winfo_children():
+                                try:
+                                    img = getattr(child, 'image', None)
+                                    if img is not None:
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception:
+                            img = None
+                    # 4) fallback: maybe the parameter was the image label itself
+                    if img is None:
+                        try:
+                            img = getattr(self, 'last_known_thumb_image', None)
+                        except Exception:
+                            img = None
                     g_lbl = ttk.Label(self._drag_ghost, image=img)
                     g_lbl.image = img
                     g_lbl.pack()
@@ -541,7 +993,39 @@ class BookScannerApp:
                 old_idx = None
             if old_idx is None:
                 return
-            # remove and insert
+            # if user didn't move the thumbnail (click without drag), don't treat as reorder
+            # compute adjusted insert index as the code would do when inserting
+            adj_insert_idx = insert_idx
+            if insert_idx > old_idx:
+                adj_insert_idx = insert_idx - 1
+            if adj_insert_idx == old_idx:
+                # no movement; simply cleanup and return (don't trigger rename dialog)
+                try:
+                    # also set selection on click without move
+                    try:
+                        prev = getattr(self, '_selected_thumb', None)
+                        if prev is not lbl:
+                            try:
+                                # stop pulse on previous
+                                if prev is not None:
+                                    try:
+                                        self._stop_selection_pulse(prev)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            self._set_selected_thumb(lbl)
+                            try:
+                                self._start_selection_pulse(lbl)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    del self._drag_data
+                except Exception:
+                    pass
+                return
+            # remove and insert (actual move)
             try:
                 self.thumbnails.pop(old_idx)
                 if insert_idx > old_idx:
@@ -557,6 +1041,8 @@ class BookScannerApp:
                     pass
             except Exception:
                 pass
+            except Exception:
+                pass
             finally:
                 try:
                     del self._drag_data
@@ -565,23 +1051,100 @@ class BookScannerApp:
         except Exception:
             pass
 
+    # ---------------- curvature estimation / unwarp -----------------------
+    def _estimate_spine_x(self, gray):
+        """Estimate spine x position by finding the darkest vertical ridge in the central area."""
+        try:
+            h, w = gray.shape[:2]
+            cx = w // 2
+            # take vertical strip around center
+            strip = gray[:, max(0, cx - w//6): min(w, cx + w//6)]
+            # vertical projection (sum of dark pixels)
+            v = np.mean(strip, axis=0)
+            # find minima in projection (dark ridge)
+            min_idx = int(np.argmin(v))
+            spine_x = max(0, cx - w//6 + min_idx)
+            return spine_x
+        except Exception:
+            return gray.shape[1] // 2
+
+    def _unwarp_curvature(self, image):
+        """Simple horizontal unwarp using estimated spine: remap x coordinates to flatten slight curvature.
+        This is a lightweight approximation (cylindrical-like).
+        """
+        try:
+            intensity = float(getattr(self, 'curvature_intensity_var', tk.DoubleVar(value=0.8)).get())
+            cols = int(getattr(self, 'curvature_mesh_cols_var', tk.IntVar(value=40)).get())
+            # use advanced mesh remap for stronger correction
+            return mesh_unwarp_advanced(image, cols=cols, intensity=intensity)
+        except Exception:
+            try:
+                return mesh_unwarp_advanced(image, cols=40, intensity=0.8)
+            except Exception:
+                return image
+
     def _open_preview(self, ruta):
         try:
+            # if preview already shows this path, close it (toggle)
+            try:
+                if getattr(self, '_preview_path', None) == os.path.abspath(ruta):
+                    return self._close_preview()
+            except Exception:
+                pass
+
             pil = Image.open(ruta)
             w, h = pil.size
             maxw, maxh = 1000, 900
             if w > maxw or h > maxh:
                 pil.thumbnail((maxw, maxh), Image.LANCZOS)
+            # reuse existing preview window if present
+            try:
+                if getattr(self, '_preview_top', None) and getattr(self, '_preview_top', 'destroyed') != 'destroyed':
+                    top = self._preview_top
+                    top.title(os.path.basename(ruta))
+                    # replace image
+                    img_tk = ImageTk.PhotoImage(pil)
+                    if getattr(self, '_preview_label', None) is None:
+                        lbl = ttk.Label(top, image=img_tk)
+                        lbl.image = img_tk
+                        lbl.pack(expand=True, fill='both')
+                        self._preview_label = lbl
+                    else:
+                        lbl = self._preview_label
+                        lbl.configure(image=img_tk)
+                        lbl.image = img_tk
+                    self._preview_path = os.path.abspath(ruta)
+                    return
+            except Exception:
+                # fall through to create new
+                pass
+
             top = tk.Toplevel(self.root)
             top.title(os.path.basename(ruta))
             img_tk = ImageTk.PhotoImage(pil)
             lbl = ttk.Label(top, image=img_tk)
             lbl.image = img_tk
             lbl.pack(expand=True, fill='both')
-            btn = ttk.Button(top, text='Cerrar', command=top.destroy)
+            btn = ttk.Button(top, text='Cerrar', command=lambda: self._close_preview())
             btn.pack(pady=6)
+            self._preview_top = top
+            self._preview_label = lbl
+            self._preview_path = os.path.abspath(ruta)
         except Exception as e:
             print('Error mostrando preview:', e)
+
+    def _close_preview(self):
+        try:
+            top = getattr(self, '_preview_top', None)
+            if top:
+                try:
+                    top.destroy()
+                except Exception:
+                    pass
+                self._preview_top = None
+                self._preview_label = None
+        except Exception:
+            pass
 
     def _show_thumb_menu(self, event, lbl):
         try:
@@ -956,7 +1519,12 @@ class BookScannerApp:
             while True:
                 if time.time() - start > timeout:
                     break
-                pts = detectar_libro(imagen)
+                # pass UI-tunable params if available
+                try:
+                    min_area = int(getattr(self, 'min_area_var', tk.IntVar(value=10000)).get())
+                except Exception:
+                    min_area = 10000
+                pts = detectar_libro(imagen, min_area=min_area)
                 if pts is not None:
                     break
                 # try a quicker adaptive-threshold fallback
@@ -977,6 +1545,12 @@ class BookScannerApp:
             if pts is not None:
                 try:
                     imagen_proc = four_point_transform(imagen, pts)
+                    # optional curvature correction
+                    try:
+                        if getattr(self, 'curvature_var', None) and self.curvature_var.get():
+                            imagen_proc = self._unwarp_curvature(imagen_proc)
+                    except Exception:
+                        pass
                 except Exception:
                     imagen_proc = imagen
             else:
@@ -1180,6 +1754,24 @@ class BookScannerApp:
         except Exception as e:
             print('Error guardando metadata folder:', e)
 
+        # persist selected thumbnail basename if present
+        try:
+            sel = getattr(self, '_selected_thumb', None)
+            if sel and getattr(sel, 'filepath', None):
+                try:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        d = json.load(f)
+                except Exception:
+                    d = data
+                try:
+                    d['selected'] = os.path.basename(sel.filepath)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        json.dump(d, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     def _apply_desired_order(self):
         """Reorder self.thumbnails widgets according to the filenames in _desired_thumb_order."""
         try:
@@ -1294,7 +1886,15 @@ class BookScannerApp:
             # update lbl.filepath for widgets
             for lbl, new in zip(self.thumbnails, new_names):
                 try:
-                    lbl.filepath = os.path.join(self.carpeta_salida, new)
+                    newpath = os.path.join(self.carpeta_salida, new)
+                    lbl.filepath = newpath
+                    # update visible filename label if present
+                    try:
+                        base = os.path.splitext(os.path.basename(newpath))[0]
+                        if getattr(lbl, 'name_label', None):
+                            lbl.name_label.configure(text=base)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             # save updated metadata
@@ -1382,6 +1982,29 @@ class BookScannerApp:
             # once metadata loaded, populate gallery
             try:
                 self._load_existing_thumbnails()
+            except Exception:
+                pass
+            # after thumbnails loaded, restore selection if present
+            try:
+                sel = data.get('selected')
+                if sel:
+                    # wait briefly for thumbnails to load then select
+                    def _restore():
+                        try:
+                            for lbl in self.thumbnails:
+                                if os.path.basename(getattr(lbl, 'filepath', '')) == sel:
+                                    try:
+                                        self._set_selected_thumb(lbl)
+                                        self._start_selection_pulse(lbl)
+                                    except Exception:
+                                        pass
+                                    break
+                        except Exception:
+                            pass
+                    try:
+                        self.root.after(200, _restore)
+                    except Exception:
+                        _restore()
             except Exception:
                 pass
         except Exception as e:
