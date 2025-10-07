@@ -134,14 +134,6 @@ class BookScannerApp:
 
         ttk.Entry(frame_form, textvariable=self.archivo_var).pack(fill="x")
         
-        # Auto-save metadata option
-        self.autosave_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
-
-        # Last-saved indicator
-        self._last_saved_var = tk.StringVar(value="Metadatos guardados: -")
-        ttk.Label(frame_form, textvariable=self._last_saved_var, foreground="#2e7d32").pack(fill="x", pady=(4, 0))
-
         # store buttons so we can enable/disable them during scanning
         self.btn_crear = ttk.Button(frame_form, text="📁 Crear carpeta", command=self.crear_carpeta)
         self.btn_crear.pack(fill="x", pady=(15, 0))
@@ -154,6 +146,31 @@ class BookScannerApp:
         self.btn_reiniciar.pack(fill="x", pady=(10, 0))
         self.btn_salir = ttk.Button(frame_form, text="❌ Salir", command=self.salir)
         self.btn_salir.pack(fill="x", pady=(10, 0))
+        
+        
+        # Auto-save metadata option
+        self.autosave_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(frame_form, text="Auto-guardar metadatos", variable=self.autosave_var).pack(fill="x", pady=(6, 0))
+
+        # Thumbnail size controls
+        ttk.Label(frame_form, text="Tamaño miniatura (px):").pack(anchor="w", pady=(8, 0))
+        self.thumb_w_var = tk.IntVar(value=120)
+        self.thumb_h_var = tk.IntVar(value=160)
+        size_frame = ttk.Frame(frame_form)
+        size_frame.pack(fill="x")
+        tk.Spinbox(size_frame, from_=60, to=400, textvariable=self.thumb_w_var, width=6).pack(side="left")
+        ttk.Label(size_frame, text="x").pack(side="left", padx=4)
+        tk.Spinbox(size_frame, from_=60, to=400, textvariable=self.thumb_h_var, width=6).pack(side="left")
+        ttk.Button(size_frame, text="Aplicar", command=lambda: (self._load_existing_thumbnails())).pack(side="left", padx=8)
+        # Optionally rename files to preserve order when reordering
+        self.rename_on_reorder_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame_form, text="Renombrar archivos al reordenar", variable=self.rename_on_reorder_var).pack(fill="x", pady=(6, 0))
+
+        # Last-saved indicator
+        self._last_saved_var = tk.StringVar(value="Metadatos guardados: -")
+        ttk.Label(frame_form, textvariable=self._last_saved_var, foreground="#2e7d32").pack(fill="x", pady=(4, 0))
+
+      
 
         # Camera selector
         frame_cam = ttk.Frame(frame_form)
@@ -186,6 +203,10 @@ class BookScannerApp:
 
         frame_gallery = ttk.LabelFrame(frame_video, text="📄 Páginas escaneadas", height=200)
         frame_gallery.pack(side="bottom", fill="x", pady=(10, 0))
+        # progress bar for thumbnail loading
+        self.thumb_progress = ttk.Progressbar(frame_gallery, orient='horizontal', mode='determinate', maximum=1, value=0)
+        self.thumb_progress.pack(side='top', fill='x', pady=(4, 4))
+        self.thumb_progress.pack_forget()
         self.canvas_gallery = tk.Canvas(frame_gallery, height=180)
         self.scroll_gallery = Scrollbar(frame_gallery, orient="horizontal", command=self.canvas_gallery.xview)
         self.canvas_gallery.configure(xscrollcommand=self.scroll_gallery.set)
@@ -233,6 +254,11 @@ class BookScannerApp:
                     child.destroy()
             except Exception:
                 pass
+            # reset desired order marker
+            try:
+                self._desired_thumb_order = None
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -243,21 +269,241 @@ class BookScannerApp:
             if not self.carpeta_salida or not os.path.isdir(self.carpeta_salida):
                 return
             archivos = sorted([f for f in os.listdir(self.carpeta_salida) if f.lower().endswith('.png')])
-            for fn in archivos:
-                ruta = os.path.join(self.carpeta_salida, fn)
-                try:
-                    img = cv2.imread(ruta)
-                    if img is None:
+
+            # prepare progress
+            total = len(archivos)
+            try:
+                if total > 0:
+                    self.thumb_progress.configure(maximum=total, value=0)
+                    self.thumb_progress.pack(side='top', fill='x', pady=(4, 4))
+                    self._thumb_load_total = total
+                    self._thumb_load_done = 0
+                else:
+                    self.thumb_progress.pack_forget()
+            except Exception:
+                pass
+
+            # load in background to avoid blocking UI for many images
+            def worker(files):
+                for fn in files:
+                    ruta = os.path.join(self.carpeta_salida, fn)
+                    try:
+                        # Use PIL in worker to open and resize; create PhotoImage on main thread
+                        pil = Image.open(ruta).convert('RGB')
+                        w = int(self.thumb_w_var.get())
+                        h = int(self.thumb_h_var.get())
+                        pil.thumbnail((w, h), Image.LANCZOS)
+                        # schedule creation of PhotoImage and widget on main thread
+                        try:
+                            self.root.after(0, lambda p=pil.copy(), r=ruta: (self._add_thumbnail_from_pil(p, r), self._thumb_progress_step()))
+                        except Exception:
+                            pass
+                    except Exception:
                         continue
-                    thumb = cv2.resize(img, (120, 160))
-                    thumb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-                    img_thumb = ImageTk.PhotoImage(Image.fromarray(thumb))
-                    lbl = ttk.Label(self.frame_thumbs, image=img_thumb)
-                    lbl.image = img_thumb
-                    lbl.pack(side="left", padx=5, pady=5)
-                    self.thumbnails.append(lbl)
+
+            t = threading.Thread(target=worker, args=(archivos,), daemon=True)
+            t.start()
+        except Exception:
+            pass
+
+    def _thumb_progress_step(self):
+        try:
+            self._thumb_load_done = getattr(self, '_thumb_load_done', 0) + 1
+            self.thumb_progress['value'] = self._thumb_load_done
+            if getattr(self, '_thumb_load_total', 0) and self._thumb_load_done >= self._thumb_load_total:
+                # finished
+                try:
+                    self.thumb_progress.pack_forget()
                 except Exception:
-                    continue
+                    pass
+                # if metadata requested a particular order, apply it
+                try:
+                    if getattr(self, '_desired_thumb_order', None):
+                        self._apply_desired_order()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _add_thumbnail_from_pil(self, pil_img, ruta):
+        try:
+            img_tk = ImageTk.PhotoImage(pil_img)
+            lbl = ttk.Label(self.frame_thumbs, image=img_tk)
+            lbl.image = img_tk
+            lbl.filepath = ruta
+            lbl.pack(side="left", padx=5, pady=5)
+            # left click opens preview
+            lbl.bind('<Button-1>', lambda e, r=ruta: self._open_preview(r))
+            # right click shows context menu
+            lbl.bind('<Button-3>', lambda e, l=lbl: self._show_thumb_menu(e, l))
+            # drag-and-drop bindings
+            lbl.bind('<ButtonPress-1>', lambda e, l=lbl: self._on_thumb_press(e, l))
+            lbl.bind('<B1-Motion>', lambda e, l=lbl: self._on_thumb_motion(e, l))
+            lbl.bind('<ButtonRelease-1>', lambda e, l=lbl: self._on_thumb_release(e, l))
+            self.thumbnails.append(lbl)
+        except Exception:
+            pass
+
+    def _on_thumb_press(self, event, lbl):
+        try:
+            self._drag_data = {'widget': lbl, 'start_x': event.x_root, 'start_y': event.y_root}
+            self._drag_ghost = None
+        except Exception:
+            pass
+
+    def _on_thumb_motion(self, event, lbl):
+        try:
+            if not hasattr(self, '_drag_data') or self._drag_data.get('widget') is None:
+                return
+            if self._drag_ghost is None:
+                # create a ghost window showing the image
+                try:
+                    self._drag_ghost = tk.Toplevel(self.root)
+                    self._drag_ghost.overrideredirect(True)
+                    img = lbl.image
+                    g_lbl = ttk.Label(self._drag_ghost, image=img)
+                    g_lbl.image = img
+                    g_lbl.pack()
+                except Exception:
+                    self._drag_ghost = None
+                    return
+            try:
+                self._drag_ghost.geometry(f"+{event.x_root+8}+{event.y_root+8}")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _on_thumb_release(self, event, lbl):
+        try:
+            if getattr(self, '_drag_ghost', None) is not None:
+                try:
+                    self._drag_ghost.destroy()
+                except Exception:
+                    pass
+                self._drag_ghost = None
+            # compute new index based on event.x_root
+            children = list(self.frame_thumbs.winfo_children())
+            positions = []
+            for c in children:
+                try:
+                    cx = c.winfo_rootx() + c.winfo_width() / 2
+                    positions.append((c, cx))
+                except Exception:
+                    positions.append((c, 0))
+            insert_idx = len(children)
+            for i, (c, cx) in enumerate(positions):
+                if event.x_root < cx:
+                    insert_idx = i
+                    break
+            try:
+                old_idx = self.thumbnails.index(lbl)
+            except Exception:
+                old_idx = None
+            if old_idx is None:
+                return
+            # remove and insert
+            try:
+                self.thumbnails.pop(old_idx)
+                if insert_idx > old_idx:
+                    insert_idx -= 1
+                self.thumbnails.insert(insert_idx, lbl)
+                self._repack_thumbnails()
+                # after reordering, save order
+                try:
+                    self._save_folder_metadata()
+                    if self.rename_on_reorder_var.get():
+                        self._rename_files_by_order()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    del self._drag_data
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _open_preview(self, ruta):
+        try:
+            pil = Image.open(ruta)
+            w, h = pil.size
+            maxw, maxh = 1000, 900
+            if w > maxw or h > maxh:
+                pil.thumbnail((maxw, maxh), Image.LANCZOS)
+            top = tk.Toplevel(self.root)
+            top.title(os.path.basename(ruta))
+            img_tk = ImageTk.PhotoImage(pil)
+            lbl = ttk.Label(top, image=img_tk)
+            lbl.image = img_tk
+            lbl.pack(expand=True, fill='both')
+            btn = ttk.Button(top, text='Cerrar', command=top.destroy)
+            btn.pack(pady=6)
+        except Exception as e:
+            print('Error mostrando preview:', e)
+
+    def _show_thumb_menu(self, event, lbl):
+        try:
+            menu = tk.Menu(self.root, tearoff=0)
+            menu.add_command(label='Eliminar página', command=lambda l=lbl: self._delete_thumb(l))
+            menu.add_command(label='Mover a la izquierda', command=lambda l=lbl: self._move_thumb(l, -1))
+            menu.add_command(label='Mover a la derecha', command=lambda l=lbl: self._move_thumb(l, 1))
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+
+    def _repack_thumbnails(self):
+        try:
+            for child in list(self.frame_thumbs.winfo_children()):
+                child.pack_forget()
+            for lbl in self.thumbnails:
+                lbl.pack(side='left', padx=5, pady=5)
+        except Exception:
+            pass
+
+    def _move_thumb(self, lbl, direction):
+        try:
+            idx = self.thumbnails.index(lbl)
+            new_idx = idx + direction
+            if new_idx < 0 or new_idx >= len(self.thumbnails):
+                return
+            self.thumbnails[idx], self.thumbnails[new_idx] = self.thumbnails[new_idx], self.thumbnails[idx]
+            self._repack_thumbnails()
+            try:
+                self._save_folder_metadata()
+                if self.rename_on_reorder_var.get():
+                    self._rename_files_by_order()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _delete_thumb(self, lbl):
+        try:
+            # confirm
+            if not messagebox.askyesno('Confirmar', '¿Eliminar esta página? Esta acción no se puede deshacer.'):
+                return
+            ruta = getattr(lbl, 'filepath', None)
+            if ruta and os.path.exists(ruta):
+                try:
+                    os.remove(ruta)
+                except Exception:
+                    pass
+            try:
+                lbl.destroy()
+            except Exception:
+                pass
+            try:
+                self.thumbnails.remove(lbl)
+            except Exception:
+                pass
+            self._repack_thumbnails()
+            try:
+                self._save_folder_metadata()
+            except Exception:
+                pass
         except Exception:
             pass
 
