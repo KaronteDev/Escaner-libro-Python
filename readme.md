@@ -2,7 +2,7 @@
 
 ## Descripción
 
-Aplicación de escritorio en \*\*Python\*\* que utiliza la cámara del ordenador para \*\*escanear libros\*\* o documentos, detectando automáticamente el área del libro, \*\*corrigiendo la perspectiva\*\* y \*\*separando las páginas izquierda y derecha\*\*.
+Aplicación de escritorio en **Python** que utiliza la cámara del ordenador para **escanear libros** o documentos, detectando automáticamente el área del libro, **corrigiendo la perspectiva** y **separando las páginas izquierda y derecha**.
 
 ## Características
 
